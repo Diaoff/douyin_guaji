@@ -42,5 +42,12 @@
     "_note_charging_notice_devices": "需要处理系统'停止充电'弹窗的设备序列号(如vivo机型)，即 adb devices 里看到的编号；不需要该判定就留空数组 []",
     "charging_notice_devices": [
         "000002f4ad09ad6e"
-    ]
+    ],
+    "_note_ocr_retry_times": "首次识别设备偏移值时，对同一张裁剪图的OCR重复次数，默认1次(1~4)。实测同一张图OCR结果确定，默认无需重复；若个别机型出现漏识别可改为2",
+    "ocr_retry_times": 1,
+    "_note_no_fudai_switch_rounds": "在同一个直播间连续多少轮判定不到福袋就主动换直播间(每轮约70秒)。设为0则从不主动换，一直等到直播间关闭或30分钟无福袋兜底",
+    "no_fudai_switch_rounds": 4,
+    "_note_countdown_window": "开奖倒计时窗口。min_countdown_seconds: 剩余少于该秒数来不及点完，不参与。max_countdown_minutes: 剩余达到该分钟数先不参与、关掉详情过会儿再看；设为0表示沿用启动参数(15分钟)。注意：读数超过900秒会被当作识别异常压到890秒，所以上限只有设成小于15才真正可能触发",
+    "min_countdown_seconds": 15,
+    "max_countdown_minutes": 15
 }

@@ -458,6 +458,21 @@ class underlying_operations:
         print("关闭抖音失败")
         return False
 
+    @staticmethod
+    def _resolve_config_path(config_path):
+        """把相对路径的配置文件解析到脚本所在目录。
+
+        config.json 原先按相对路径读取，即相对于「当前工作目录」。只要不是先 cd 到项目目录
+        再运行（双击、快捷方式、用绝对路径调用等），就会静默读不到配置，
+        导致 contains_want / contains_not_want 等关键词列表全为空、筛选逻辑失效。
+        """
+        if os.path.isabs(config_path) or os.path.exists(config_path):
+            return config_path
+        beside_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), config_path)
+        if os.path.exists(beside_script):
+            return beside_script
+        return config_path
+
     def load_config(self, config_path="config.json", key="contains_want", default=None):
         """从配置文件中加载数据
 
@@ -465,6 +480,7 @@ class underlying_operations:
         """
         if default is None:
             default = []
+        config_path = self._resolve_config_path(config_path)
         if not os.path.exists(config_path):
             print("未找到配置文件{}，{} 使用默认值".format(config_path, key))
             return default
@@ -484,6 +500,7 @@ class underlying_operations:
         """
         if device_offsets is None:
             device_offsets = {}
+        config_path = self._resolve_config_path(config_path)
 
         if os.path.exists(config_path):
             with open(config_path, 'r', encoding='utf-8') as file:

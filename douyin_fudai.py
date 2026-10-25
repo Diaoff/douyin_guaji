@@ -49,6 +49,15 @@ class fudai_analyse:
 
     # ---- 其它阈值 ----
     BATTERY_LOW_THRESHOLD = 30      # 低于该电量进入待机等待
+    # find_y_offset 中同一张裁剪图的 OCR 重复次数（config.json 的 ocr_retry_times 可覆盖）。
+    # 旧实现固定为 2，但对完全相同的图片重复识别是纯浪费：实测 PaddleOCR 对同一张图结果确定。
+    DEFAULT_OCR_RETRY_TIMES = 1
+    MAX_OCR_RETRY_TIMES = 4
+    # 连续多少轮"本轮无福袋"后主动换直播间（config.json 的 no_fudai_switch_rounds 可覆盖）。
+    # 旧实现里 wait_times 只被置 0、从不自增，导致这条逻辑一直没生效；0 表示关闭该行为。
+    DEFAULT_NO_FUDAI_SWITCH_ROUNDS = 4
+    # 开奖倒计时窗口下界：剩余少于该秒数来不及点完，不参与
+    DEFAULT_MIN_COUNTDOWN_SECONDS = 15
 
     def __init__(self):
         self.device_id = 'xxxxxxxx'
@@ -77,6 +86,15 @@ class fudai_analyse:
         self.device_offsets = self.operation.load_config("config.json", "device_offsets")
         # 需要处理"停止充电"弹窗的设备（如 vivo），原先硬编码在代码里
         self.charging_notice_devices = self.operation.load_config("config.json", "charging_notice_devices")
+        self.ocr_retry_times = self._load_ocr_retry_times()
+        # 连续多少轮无福袋就主动换直播间；0 = 关闭该行为（一直等到直播间关闭）
+        self.no_fudai_switch_rounds = self._load_int_config(
+            "no_fudai_switch_rounds", self.DEFAULT_NO_FUDAI_SWITCH_ROUNDS, 0, 100)
+        # 开奖倒计时窗口：太短来不及参与；太长（上限）先不参与
+        self.min_countdown_seconds = self._load_int_config(
+            "min_countdown_seconds", self.DEFAULT_MIN_COUNTDOWN_SECONDS, 0, 600)
+        # 上限设为 0 表示沿用 fudai_choujiang(wait_minutes=...) 传入的值
+        self.max_countdown_minutes = self._load_int_config("max_countdown_minutes", 0, 0, 60)
         self.current_page_type = 1
         self.page_name = {1: "直播间页", 2: "关注的正在直播列表页", 3: "个人中心关注页", 4: "订单支付完成页",
                           5: "首页-个人中心", 6: "首页-内容推荐", 7: "下单页"}
@@ -87,6 +105,27 @@ class fudai_analyse:
         if start <= end:
             return start <= hour <= end
         return hour >= start or hour <= end
+
+    def _load_int_config(self, key, default, minimum, maximum):
+        """从 config.json 读取一个整数配置项，非法值回退默认值、越界值收敛到范围内"""
+        value = self.operation.load_config("config.json", key, default=default)
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            print("config.json 中的 {} 不是整数({!r})，按默认值{}处理".format(key, value, default))
+            return default
+        if number < minimum:
+            print("{}={} 小于下限，按{}处理".format(key, number, minimum))
+            return minimum
+        if number > maximum:
+            print("{}={} 超过上限，按{}处理".format(key, number, maximum))
+            return maximum
+        return number
+
+    def _load_ocr_retry_times(self):
+        """读取 config.json 的 ocr_retry_times（同一张裁剪图的 OCR 重复次数）"""
+        return self._load_int_config("ocr_retry_times", self.DEFAULT_OCR_RETRY_TIMES,
+                                     1, self.MAX_OCR_RETRY_TIMES)
 
     def close_log(self):
         """关闭日志文件句柄，避免长时间运行导致句柄泄漏（由atexit兜底调用）"""
@@ -225,10 +264,14 @@ class fudai_analyse:
         found_first_match = False  # 是否找到第一个匹配值
         
         for offset in test_offsets:
-            for test_offset in [offset, -offset]:  # 测试正负两个值
+            # offset=0 时 +0 与 -0 指向同一张裁剪图，去重可省掉一整轮重复识别
+            for test_offset in dict.fromkeys([offset, -offset]):  # 测试正负两个值
                 self.cut_pic(70, 2166+test_offset, 240, 2208+test_offset, '', 'say_something')
                 matched = False
-                for loop in range(2):
+                # OCR 对同一张图是确定性的（已实测），因此默认只识别 1 轮；
+                # 每轮会依次尝试两种二值化模式，两种模式的结果可能不同，故不去重。
+                # 若个别机型出现漏识别，可在 config.json 里把 ocr_retry_times 调回 2。
+                for loop in range(self.ocr_retry_times):
                     for i in [0, 2]:
                         say_something = self.operation.analyse_pic_word('say_something', i)
                         if "说点" in say_something:  # 说点什么
@@ -243,7 +286,8 @@ class fudai_analyse:
                             break
                     if matched:
                         break
-                    self.operation.delay(0.1)
+                    if loop + 1 < self.ocr_retry_times:  # 仅在还有下一轮时才等待
+                        self.operation.delay(0.1)
                 
                 if not matched:
                     if found_first_match:  # 只有在找到第一个匹配值后才开始计数连续失败
@@ -1064,14 +1108,21 @@ class fudai_analyse:
             return False
 
         def handle_wait_time(stats):
-            """处理等待时间的情况"""
-            if stats['wait_times'] >= 4:
+            """连续若干轮判定不到福袋就换直播间
+
+            旧实现判断 stats['wait_times'] >= 4，但 wait_times 全代码只被置 0、从不自增，
+            因此这条逻辑从未生效（房间没福袋时会一直等到 30 分钟兜底或房间关闭）。
+            no_fudai_switch_rounds=0 可关闭该行为，恢复"一直等到房间关闭"。
+            """
+            if self.no_fudai_switch_rounds <= 0:
+                return False
+            if stats['wait_times'] >= self.no_fudai_switch_rounds:
                 if stats['swipe_times'] < 10:
                     self.swipe(760, 1600, 760, 800, 200)
-                    print("直播间等待2分钟无福袋，上划切换直播间")
+                    print("连续{}轮无福袋，上划切换直播间".format(stats['wait_times']))
                     stats['swipe_times'] += 1
                 else:
-                    print("直播间等待2分钟无福袋，退出返回直播列表")
+                    print("连续{}轮无福袋且已切换10个直播间，退出返回直播列表".format(stats['wait_times']))
                     self.back_to_zhibo_list()
                     self.into_zhibo_from_list()
                     stats['swipe_times'] = 0
@@ -1166,29 +1217,41 @@ class fudai_analyse:
                     return True
             return False
 
-        def handle_countdown_check(x, stats, lastsecond, needswitch, wait_minutes):
-            """处理倒计时检查"""
-            if lastsecond < 15 and needswitch:
-                self.click(x + 45, 430)
-                print("点击小福袋位置，关闭福袋详情")
-                self.operation.delay(1)
-                if needswitch:
-                    self.swipe(760, 1600, 760, 800, 200)
-                    print("抽奖倒计时时间小于15秒，不参与，上划切换直播间")
-                    stats['swipe_times'] += 1
-                self.operation.delay(5)
-                return True
-                
-            if needswitch and lastsecond >= 60 * wait_minutes:
-                self.click(x + 45, 430)
-                print(f"点击小福袋位置，关闭福袋详情")
-                self.operation.delay(1)
+        def handle_countdown_check(x, stats, lastsecond, needswitch, max_countdown_minutes):
+            """开奖倒计时窗口判定：太短来不及、太长先不参与
+
+            旧实现把两个阈值都以 needswitch 为前提，而入口写死 needswitch=False，
+            因此默认的"不切换直播间"模式下这两条规则完全不生效（剩 3 秒也会照样参与并干等）。
+            现在两种模式都会判定，区别只在"不参与之后怎么办"：
+            - needswitch=True：关掉详情后上划换直播间（原行为）
+            - needswitch=False：关掉详情后原地等一会儿再看，不换房间
+            注意：max_countdown_minutes 只有设成小于 15 才真正可能触发，
+            因为 check_countdown() 会把超过 900 秒的读数当识别异常压到 890 秒。
+            """
+            too_late = 0 <= lastsecond < self.min_countdown_seconds
+            too_early = max_countdown_minutes > 0 and lastsecond >= 60 * max_countdown_minutes
+            if not (too_late or too_early):
+                return False
+            self.click(x + 45, 430)
+            print("点击小福袋位置，关闭福袋详情")
+            self.operation.delay(1)
+            if needswitch:
                 self.swipe(760, 1600, 760, 800, 200)
-                print(f"抽奖倒计时时间大于{wait_minutes}分钟，暂不参与，上划切换直播间")
+                print("抽奖倒计时窗口不合适（剩余{}秒），不参与，上划切换直播间".format(lastsecond))
                 stats['swipe_times'] += 1
                 self.operation.delay(5)
                 return True
-            return False
+            if too_late:
+                wait_seconds = 60
+                print("开奖倒计时只剩{}秒（少于{}秒）来不及参与，等待{}秒后再看".format(
+                    lastsecond, self.min_countdown_seconds, wait_seconds))
+            else:
+                # 等到倒计时落进窗口内再回来看；单次最多等 5 分钟，避免长时间不响应
+                wait_seconds = int(min(max(lastsecond - 60 * max_countdown_minutes + 5, 30), 300))
+                print("开奖倒计时还有{}秒（超过{}分钟），暂不参与，等待{}秒后再看".format(
+                    lastsecond, max_countdown_minutes, wait_seconds))
+            self.operation.delay(wait_seconds)
+            return True
 
         def handle_failed_participation(stats):
             """处理参与失败的情况"""
@@ -1214,6 +1277,10 @@ class fudai_analyse:
 
         # 主循环
         stats = initialize()
+        # 上限为 0 表示不判定上限（沿用入口传入的 wait_minutes）
+        effective_max_minutes = self.max_countdown_minutes if self.max_countdown_minutes > 0 else wait_minutes
+        print("倒计时窗口：剩余少于{}秒不参与；剩余达到{}分钟先不参与（needswitch={}）".format(
+            self.min_countdown_seconds, effective_max_minutes, needswitch))
         while True:
             self.deal_battery_level()
             current_hour = self.operation.get_current_hour()
@@ -1237,7 +1304,11 @@ class fudai_analyse:
             elif handle_wait_time(stats):
                 continue
             else:
-                print("直播间暂无福袋，等待60S")
+                # 本轮在直播间里没找到福袋：计数 +1，供 handle_wait_time 决定何时换房间
+                stats['wait_times'] += 1
+                print("直播间暂无福袋，等待60S（本轮无福袋计数 {}/{}）".format(
+                    stats['wait_times'],
+                    self.no_fudai_switch_rounds if self.no_fudai_switch_rounds > 0 else '不限'))
                 self.operation.delay(60)
                 continue
             # 处理福袋内容
@@ -1251,7 +1322,7 @@ class fudai_analyse:
             lastsecond, future_timestamp = countdown_result
             
             # 检查倒计时时间
-            if handle_countdown_check(x, stats, lastsecond, needswitch, wait_minutes):
+            if handle_countdown_check(x, stats, lastsecond, needswitch, effective_max_minutes):
                 continue
                 
             # 参与抽奖

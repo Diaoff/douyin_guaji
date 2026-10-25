@@ -386,6 +386,210 @@ try:
 except UnicodeEncodeError as e:  # pragma: no cover
     check("GBK 控制台下不可编码字符不再抛异常", False, repr(e))
 
+# ---------- 11. find_y_offset 的 OCR 去重（带开关）----------
+off_dir = os.path.join(tempfile.gettempdir(), "dsh_offset_test")
+os.makedirs(os.path.join(off_dir, "pic"), exist_ok=True)
+Image.new("RGB", (1080, 2400), (250, 250, 250)).save(os.path.join(off_dir, "pic", "screenshot.png"))
+# 渲染一张与真实裁剪同尺寸 (170x42) 的"说点什么"，用于验证 OCR 可重复性这一去重前提
+probe_img = Image.new("RGB", (170, 42), (250, 250, 250))
+ImageDraw.Draw(probe_img).text((3, 5), "说点什么...",
+                               font=ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", 24),
+                               fill=(150, 150, 150))
+probe_img.save(os.path.join(off_dir, "pic", "say_something.png"))
+
+with mock.patch.object(uo_module, "__file__", os.path.join(off_dir, "Underlying_Operations.py")), \
+        mock.patch.object(df_module, "__file__", os.path.join(off_dir, "douyin_fudai.py")):
+    # 去重的前提：同一张裁剪图 + 同一模式，OCR 结果必须可重复
+    r_first = ops.analyse_pic_word("say_something", 0)
+    r_more = [ops.analyse_pic_word("say_something", 0) for _ in range(3)]
+    check("OCR 对同一张图可重复（去重前提成立）", all(r == r_first for r in r_more), f"{r_first!r}")
+    check("去重后仍能识别到'说点'", "说点" in r_first, f"{r_first!r}")
+
+    def count_find_y_offset_calls(retry_times):
+        """最坏情况（全部不匹配）下统计 OCR 调用次数"""
+        counter = {'n': 0}
+
+        def fake_analyse(*args, **kwargs):
+            counter['n'] += 1
+            return ''
+
+        original_analyse = ops.analyse_pic_word
+        saved = (ops.delay, ops.get_screenshot, analyser.device_id,
+                 analyser.device_offsets, analyser.ocr_retry_times)
+        ops.analyse_pic_word = fake_analyse
+        ops.delay = lambda *a, **k: None
+        ops.get_screenshot = lambda *a, **k: True
+        analyser.device_id = 'offset-bench'
+        analyser.device_offsets = {}
+        analyser.ocr_retry_times = retry_times
+        try:
+            returned = analyser.find_y_offset()
+        finally:
+            ops.analyse_pic_word = original_analyse
+            (ops.delay, ops.get_screenshot, analyser.device_id,
+             analyser.device_offsets, analyser.ocr_retry_times) = saved
+        return counter['n'], returned
+
+    calls_1, result_1 = count_find_y_offset_calls(1)
+    calls_2, result_2 = count_find_y_offset_calls(2)
+    check("去重后最坏情况 OCR 调用=102（旧实现为 208）", calls_1 == 102, f"调用{calls_1}次")
+    check("开关 ocr_retry_times=2 可恢复重复识别", calls_2 == 204, f"调用{calls_2}次")
+    check("两种设置返回一致", result_1 == result_2, f"{result_1} vs {result_2}")
+
+check("默认 ocr_retry_times=1", analyser.ocr_retry_times == 1, str(analyser.ocr_retry_times))
+check("config.json 暴露 ocr_retry_times 开关",
+      "ocr_retry_times" in open(os.path.join(REPO_ROOT, "config.json"), encoding="utf-8").read())
+
+# 11.1 配置文件必须按「脚本所在目录」解析：
+#      本测试开头已 chdir 到临时目录，若仍按相对路径读取，这里就会读不到内容。
+#      注意这里直接重新 load_config（而不是读 analyser.contains_want），
+#      因为第 7 节已经把实例属性覆盖成单元素列表了。
+loaded_want = ops.load_config("config.json", "contains_want")
+loaded_not_want = ops.load_config("config.json", "contains_not_want")
+check("换工作目录后仍能读到 config.json（关键词非空）",
+      len(loaded_want) > 0 and len(loaded_not_want) > 0 and "鱼竿" in loaded_want,
+      f"want={len(loaded_want)} not_want={len(loaded_not_want)}")
+check("配置文件解析到脚本所在目录而非工作目录",
+      os.path.dirname(os.path.abspath(ops._resolve_config_path("config.json"))) == REPO_ROOT,
+      ops._resolve_config_path("config.json"))
+
+# ---------- 12. 无福袋换房间计数 + 倒计时窗口解耦 ----------
+fudai_tree = ast.parse(fudai_src)
+
+# 12.1 静态防护：防止 wait_times 的计数再次丢失
+has_wait_increment = any(
+    isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Subscript)
+    and isinstance(node.target.slice, ast.Constant) and node.target.slice.value == 'wait_times'
+    for node in ast.walk(fudai_tree))
+check("主循环里存在 wait_times 自增（防止再次丢失计数）", has_wait_increment)
+
+cd_func = [n for n in ast.walk(fudai_tree)
+           if isinstance(n, ast.FunctionDef) and n.name == 'handle_countdown_check'][0]
+cd_assigns = {n.targets[0].id: n.value for n in ast.walk(cd_func)
+              if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)}
+check("倒计时窗口判定已与 needswitch 解耦",
+      'too_late' in cd_assigns and 'too_early' in cd_assigns
+      and 'needswitch' not in ast.dump(cd_assigns['too_late'])
+      and 'needswitch' not in ast.dump(cd_assigns['too_early']))
+
+# 12.2 配置项默认值
+check("默认 no_fudai_switch_rounds=4", analyser.no_fudai_switch_rounds == 4,
+      str(analyser.no_fudai_switch_rounds))
+check("默认 min_countdown_seconds=15", analyser.min_countdown_seconds == 15,
+      str(analyser.min_countdown_seconds))
+check("默认 max_countdown_minutes=15", analyser.max_countdown_minutes == 15,
+      str(analyser.max_countdown_minutes))
+
+
+class _LoopEscape(Exception):
+    """用于从 fudai_choujiang 的死循环里跳出来"""
+
+
+def drive_main_loop(*, have_fudai=False, time_text='', switch_rounds=4,
+                    min_seconds=15, max_minutes=15, needswitch=False, max_rounds=6):
+    """驱动真实的 fudai_choujiang 主循环，返回观察到的事件。
+
+    have_fudai=False 时每轮都判定不到福袋（验证换房间计数）；
+    have_fudai=True 时每轮都找到福袋，并按 time_text 走倒计时判定。
+    三处跳出点：轮次上限 / 换房间(swipe) / 参与抽奖(attend_choujiang)。
+    """
+    events = {'rounds': 0, 'swipes': 0, 'delays': [], 'participated': False}
+    saved = []
+
+    def patch(obj, name, value):
+        saved.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    def fake_check_have_fudai():
+        events['rounds'] += 1
+        if events['rounds'] > max_rounds:
+            raise _LoopEscape()
+        return 300 if have_fudai else False
+
+    def fake_swipe(*args, **kwargs):
+        events['swipes'] += 1
+        raise _LoopEscape()
+
+    def fake_delay(*args, **kwargs):
+        events['delays'].append(args[0] if args else 0)
+
+    def fake_attend(*args, **kwargs):
+        events['participated'] = True
+        raise _LoopEscape()
+
+    patch(ops, 'delay', fake_delay)
+    patch(ops, 'get_screenshot', lambda *a, **k: True)
+    patch(ops, 'get_current_hour', lambda: 12)      # 固定白天，避开夜间停机
+    patch(ops, 'click', lambda *a, **k: None)
+    patch(ops, 'get_device_resolution', lambda *a, **k: (1080, 2400))
+    patch(analyser, 'find_y_offset', lambda *a, **k: 0)
+    patch(analyser, 'check_have_fudai', fake_check_have_fudai)
+    patch(analyser, 'swipe', fake_swipe)
+    patch(analyser, 'deal_battery_level', lambda *a, **k: None)
+    patch(analyser, 'check_zhibo_is_closed', lambda *a, **k: False)
+    patch(analyser, 'check_in_zhibo_list', lambda *a, **k: False)
+    patch(analyser, 'find_fudai_detail_top_y', lambda *a, **k: 1000)
+    patch(analyser, 'get_fudai_contain_and_countdown', lambda top_y=1000: ('鱼竿大奖', time_text))
+    patch(analyser, 'check_contain', lambda *a, **k: False)   # 内容想要 -> 继续
+    patch(analyser, 'attend_choujiang', fake_attend)
+    patch(analyser, 'no_fudai_switch_rounds', switch_rounds)
+    patch(analyser, 'min_countdown_seconds', min_seconds)
+    patch(analyser, 'max_countdown_minutes', max_minutes)
+    saved.append((analyser, 'last_find_fudai_time', analyser.last_find_fudai_time))
+    analyser.last_find_fudai_time = time.time()
+    try:
+        analyser.fudai_choujiang('loop-test', needswitch, 15)
+    except _LoopEscape:
+        pass
+    finally:
+        for obj, name, value in reversed(saved):
+            setattr(obj, name, value)
+    return events
+
+
+# 12.3 连续 2 轮无福袋 -> 第 3 轮换房间（旧实现永不触发）
+ev = drive_main_loop(have_fudai=False, switch_rounds=2)
+check("连续2轮无福袋后第3轮主动换房间", ev['swipes'] == 1 and ev['rounds'] == 3,
+      f"轮次={ev['rounds']} 换房间={ev['swipes']}")
+
+# 12.4 开关设为 0 -> 恢复"一直等到房间关闭"
+ev = drive_main_loop(have_fudai=False, switch_rounds=0, max_rounds=6)
+check("no_fudai_switch_rounds=0 时不主动换房间", ev['swipes'] == 0 and ev['rounds'] == 7,
+      f"轮次={ev['rounds']} 换房间={ev['swipes']}")
+
+# 12.5 倒计时窗口：默认模式下"只剩几秒就不参与"现在真的生效
+ev = drive_main_loop(have_fudai=True, time_text='0342')
+check("窗口内(222秒)会参与抽奖", ev['participated'], f"participated={ev['participated']}")
+
+ev = drive_main_loop(have_fudai=True, time_text='0008')
+check("只剩8秒时不参与（旧实现会照样参与）",
+      not ev['participated'] and 60 in ev['delays'],
+      f"participated={ev['participated']} delays={ev['delays']}")
+
+ev = drive_main_loop(have_fudai=True, time_text='1000', max_minutes=5)
+check("上限设5分钟、剩10分钟时不参与并等待",
+      not ev['participated'] and 300 in ev['delays'],
+      f"participated={ev['participated']} delays={ev['delays']}")
+
+# 12.6 已知交互：读数超过900秒会被压到890秒，所以上限=15分钟几乎无法触发
+ev = drive_main_loop(have_fudai=True, time_text='2000', max_minutes=15)
+check("上限15分钟时 20:00 被压到890秒 -> 仍会参与（已知交互）", ev['participated'],
+      f"participated={ev['participated']}")
+
+# 12.7 回归：needswitch=True 时仍是"关掉详情后上划换直播间"的原行为
+ev = drive_main_loop(have_fudai=True, time_text='0008', needswitch=True)
+check("换房间模式：只剩8秒时上划换直播间（原行为）",
+      ev['swipes'] == 1 and not ev['participated'],
+      f"swipes={ev['swipes']} participated={ev['participated']}")
+
+ev = drive_main_loop(have_fudai=True, time_text='1000', max_minutes=5, needswitch=True)
+check("换房间模式：剩10分钟（上限5分钟）时上划换直播间",
+      ev['swipes'] == 1 and not ev['participated'],
+      f"swipes={ev['swipes']} participated={ev['participated']}")
+
+ev = drive_main_loop(have_fudai=True, time_text='0342', needswitch=True)
+check("换房间模式：窗口内仍会参与", ev['participated'], f"participated={ev['participated']}")
+
 # ---------- 汇总 ----------
 failed = [r for r in results if not r[1]]
 print("\n===== 冒烟结果: %d/%d 通过 =====" % (len(results) - len(failed), len(results)))
