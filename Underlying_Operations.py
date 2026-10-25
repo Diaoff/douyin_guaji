@@ -22,6 +22,7 @@ class underlying_operations:
 
     def __init__(self):
         self.ocr = PaddleOCR()
+        self._brightness_backup = None  # 进入前的屏幕亮度设置，退出时还原
         logging.disable(logging.DEBUG)
         logging.disable(logging.WARNING)
 
@@ -213,6 +214,107 @@ class underlying_operations:
         height = int(match.group(2))
         print("设备分辨率为：{}*{}".format(width, height))
         return width, height
+
+    # ------------------------------------------------------------------
+    # 屏幕亮度（运行时调低省电）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _output_looks_like_error(output):
+        """cmd 子命令在旧机型上可能返回0但输出 Unknown command / Error 之类"""
+        lowered = (output or '').lower()
+        return any(word in lowered for word in ('unknown', 'error', 'exception', 'not found'))
+
+    def get_screen_brightness(self, device_id):
+        """读取当前亮度设置
+
+        Returns:
+            (brightness, mode)：settings 里的原始字符串；读不到返回 None
+        """
+        ok_b, brightness = self._adb(['shell', 'settings', 'get', 'system', 'screen_brightness'],
+                                     device_id=device_id, retries=self.ADB_RETRIES)
+        ok_m, mode = self._adb(['shell', 'settings', 'get', 'system', 'screen_brightness_mode'],
+                               device_id=device_id, retries=self.ADB_RETRIES)
+        brightness = brightness.strip() if ok_b else None
+        mode = mode.strip() if ok_m else None
+        if brightness in ('', 'null'):
+            brightness = None
+        if mode in ('', 'null'):
+            mode = None
+        return brightness, mode
+
+    def set_screen_brightness(self, device_id, percent):
+        """把屏幕亮度调到指定百分比（1~100），并记住原值以便退出时还原
+
+        亮度是背光/面板级设置，不改变 screencap 截到的画面内容，
+        因此降低亮度不会影响 OCR 与福袋图标的像素颜色判定。
+
+        优先用 Android 11+ 的 cmd display set-brightness（归一化 0~1，不依赖机型量程），
+        失败或不被支持时退回 settings put system screen_brightness（按常见 0~255 量程换算）。
+        Returns:
+            bool: 是否成功下发了亮度设置
+        """
+        try:
+            percent = max(1, min(100, int(percent)))
+        except (TypeError, ValueError):
+            print("亮度值{}非法，跳过亮度调整".format(percent))
+            return False
+
+        if self._brightness_backup is None:
+            brightness, mode = self.get_screen_brightness(device_id)
+            self._brightness_backup = {'device_id': device_id, 'brightness': brightness,
+                                       'mode': mode, 'used_cmd': False}
+            print("已记录原屏幕亮度：{}（自动亮度模式={}）".format(brightness, mode))
+
+        # 自动亮度会立刻把手动值覆盖回去，必须先关掉
+        self._adb(['shell', 'settings', 'put', 'system', 'screen_brightness_mode', '0'],
+                  device_id=device_id, retries=self.MUTATING_RETRIES)
+
+        value = percent / 100.0
+        ok, output = self._adb(['shell', 'cmd', 'display', 'set-brightness', '{:.4f}'.format(value)],
+                               device_id=device_id, retries=self.MUTATING_RETRIES)
+        if ok and not self._output_looks_like_error(output):
+            self._brightness_backup['used_cmd'] = True
+            print("屏幕亮度已调低到{}%（cmd display set-brightness）".format(percent))
+            self._warn_extra_dim(device_id)
+            return True
+
+        # 退回 settings 方式（量程按常见的 0~255 换算）
+        raw = int(round(value * 255))
+        ok, _ = self._adb(['shell', 'settings', 'put', 'system', 'screen_brightness', str(raw)],
+                          device_id=device_id, retries=self.MUTATING_RETRIES)
+        if ok:
+            print("屏幕亮度已调低到{}%（settings，写入原始值{}，按0~255量程换算）".format(percent, raw))
+            self._warn_extra_dim(device_id)
+            return True
+        print("设置屏幕亮度失败，继续以原亮度运行")
+        return False
+
+    def _warn_extra_dim(self, device_id):
+        """「极暗/额外调光」会真的压暗画面内容，可能影响识别；这里只提醒，不改用户设置"""
+        ok, output = self._adb(['shell', 'settings', 'get', 'secure', 'reduce_bright_colors_activated'],
+                               device_id=device_id, retries=self.ADB_RETRIES)
+        if ok and output.strip() == '1':
+            print("提示：系统已开启“极暗/额外调光”，它会压暗画面内容，"
+                  "可能影响福袋图标颜色判定与文字识别，建议关闭后再挂机")
+
+    def restore_screen_brightness(self):
+        """还原进入前的亮度设置（由 atexit 兜底调用；可重复调用）"""
+        backup = self._brightness_backup
+        if not backup:
+            return False
+        device_id = backup.get('device_id')
+        if backup.get('used_cmd'):
+            self._adb(['shell', 'cmd', 'display', 'reset-brightness'], device_id=device_id,
+                      retries=self.MUTATING_RETRIES)
+        if backup.get('brightness'):
+            self._adb(['shell', 'settings', 'put', 'system', 'screen_brightness', backup['brightness']],
+                      device_id=device_id, retries=self.MUTATING_RETRIES)
+        if backup.get('mode'):
+            self._adb(['shell', 'settings', 'put', 'system', 'screen_brightness_mode', backup['mode']],
+                      device_id=device_id, retries=self.MUTATING_RETRIES)
+        print("已还原屏幕亮度：{}（自动亮度模式={}）".format(backup.get('brightness'), backup.get('mode')))
+        self._brightness_backup = None
+        return True
 
     def save_reward_pic(self, device_id):
         """保存中奖截图"""

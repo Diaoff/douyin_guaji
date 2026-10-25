@@ -58,6 +58,8 @@ class fudai_analyse:
     DEFAULT_NO_FUDAI_SWITCH_ROUNDS = 4
     # 开奖倒计时窗口下界：剩余少于该秒数来不及点完，不参与
     DEFAULT_MIN_COUNTDOWN_SECONDS = 15
+    # 运行时屏幕亮度（百分比）：挂机时调低省电，0 表示不做调整
+    DEFAULT_SCREEN_BRIGHTNESS = 20
 
     def __init__(self):
         self.device_id = 'xxxxxxxx'
@@ -95,6 +97,9 @@ class fudai_analyse:
             "min_countdown_seconds", self.DEFAULT_MIN_COUNTDOWN_SECONDS, 0, 600)
         # 上限设为 0 表示沿用 fudai_choujiang(wait_minutes=...) 传入的值
         self.max_countdown_minutes = self._load_int_config("max_countdown_minutes", 0, 0, 60)
+        # 挂机时把屏幕亮度调低省电；0 = 不调整
+        self.screen_brightness = self._load_int_config(
+            "screen_brightness", self.DEFAULT_SCREEN_BRIGHTNESS, 0, 100)
         self.current_page_type = 1
         self.page_name = {1: "直播间页", 2: "关注的正在直播列表页", 3: "个人中心关注页", 4: "订单支付完成页",
                           5: "首页-个人中心", 6: "首页-内容推荐", 7: "下单页"}
@@ -995,6 +1000,22 @@ class fudai_analyse:
             self.back_to_zhibo_list()
             self.operation.delay(1800)  # 挂机30分钟
 
+    def apply_screen_brightness(self):
+        """挂机时调低屏幕亮度省电，退出时自动还原
+
+        亮度是背光/面板级设置，不改变 screencap 截到的画面内容，
+        因此降低亮度不会影响 OCR 识别和福袋图标的像素颜色判定。
+        亮度值由 config.json 的 screen_brightness 控制（1~100，0=不调整）。
+        """
+        if self.screen_brightness <= 0:
+            print("screen_brightness=0，保持系统亮度不做调整")
+            return False
+        if not self.operation.set_screen_brightness(self.device_id, self.screen_brightness):
+            return False
+        # 退出时还原；restore 是幂等的，重复注册无副作用
+        atexit.register(self.operation.restore_screen_brightness)
+        return True
+
     def check_stop_charging(self):
         """针对vivo设备，判断长时间连接弹出停止充电的弹窗"""
         self.cut_pic(225, 1951, 865, 2051, '', 'charging_stop_notice')
@@ -1031,6 +1052,7 @@ class fudai_analyse:
             """初始化参数"""
             self.device_id = device_id
             self.resolution_ratio_x, self.resolution_ratio_y = self.operation.get_device_resolution(self.device_id)
+            self.apply_screen_brightness()  # 先调低亮度省电，再做后续识别
             self.y_pianyi = self.find_y_offset()
             return {
                 'wait_times': 0,  # 当前直播间的等待次数

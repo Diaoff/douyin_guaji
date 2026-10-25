@@ -49,5 +49,7 @@
     "no_fudai_switch_rounds": 4,
     "_note_countdown_window": "开奖倒计时窗口。min_countdown_seconds: 剩余少于该秒数来不及点完，不参与。max_countdown_minutes: 剩余达到该分钟数先不参与、关掉详情过会儿再看；设为0表示沿用启动参数(15分钟)。注意：读数超过900秒会被当作识别异常压到890秒，所以上限只有设成小于15才真正可能触发",
     "min_countdown_seconds": 15,
-    "max_countdown_minutes": 15
+    "max_countdown_minutes": 15,
+    "_note_screen_brightness": "挂机时把屏幕亮度调低省电，单位百分比(1~100)，0=不调整。亮度属于背光级设置，不改变截图内容，所以不影响OCR和颜色判定；程序退出时会自动还原原亮度。若系统开了'极暗/额外调光'会压暗画面内容并影响识别，程序会提示",
+    "screen_brightness": 20
 }

@@ -166,11 +166,9 @@ def capture_adb(call, outputs=None, returncode=0):
         box['cmd'] = [str(c) for c in cmd]
         box['kwargs'] = kwargs
         joined = ' '.join(box['cmd'])
-        stdout = b''
-        for key, value in outputs.items():
-            if key in joined:
-                stdout = value.encode()
-                break
+        # 取「最长匹配」的键：避免 screen_brightness 与 screen_brightness_mode 这类前缀互相误命中
+        matched = [key for key in outputs if key in joined]
+        stdout = outputs[max(matched, key=len)].encode() if matched else b''
         return sp.CompletedProcess(args=cmd, returncode=returncode, stdout=stdout, stderr=b'')
 
     with mock.patch('subprocess.run', fake_run), \
@@ -523,6 +521,8 @@ def drive_main_loop(*, have_fudai=False, time_text='', switch_rounds=4,
     patch(ops, 'click', lambda *a, **k: None)
     patch(ops, 'get_device_resolution', lambda *a, **k: (1080, 2400))
     patch(analyser, 'find_y_offset', lambda *a, **k: 0)
+    # 屏蔽亮度调整，避免驱动测试真的去连 adb（亮度由第 13 节单独覆盖）
+    patch(analyser, 'apply_screen_brightness', lambda *a, **k: False)
     patch(analyser, 'check_have_fudai', fake_check_have_fudai)
     patch(analyser, 'swipe', fake_swipe)
     patch(analyser, 'deal_battery_level', lambda *a, **k: None)
@@ -589,6 +589,106 @@ check("换房间模式：剩10分钟（上限5分钟）时上划换直播间",
 
 ev = drive_main_loop(have_fudai=True, time_text='0342', needswitch=True)
 check("换房间模式：窗口内仍会参与", ev['participated'], f"participated={ev['participated']}")
+
+# ---------- 13. 运行时降低屏幕亮度省电 ----------
+
+
+def capture_all_adb(call, outputs=None, fail_when=None):
+    """记录调用期间所有 adb argv；fail_when 命中时让该条命令返回非0"""
+    outputs = outputs or {}
+    recorded = []
+
+    def fake_run(cmd, **kwargs):
+        argv = [str(c) for c in cmd]
+        joined = ' '.join(argv)
+        recorded.append(joined)
+        returncode_here = 1 if (fail_when and fail_when in joined) else 0
+        # 取「最长匹配」的键：避免 screen_brightness 与 screen_brightness_mode 这类前缀互相误命中
+        matched = [key for key in outputs if key in joined]
+        stdout = outputs[max(matched, key=len)].encode() if matched else b''
+        return sp.CompletedProcess(args=cmd, returncode=returncode_here, stdout=stdout, stderr=b'')
+
+    with mock.patch('subprocess.run', fake_run), \
+            mock.patch.object(ops, 'delay', lambda *a, **k: None):
+        call()
+    return recorded
+
+
+bright_outputs = {'settings get system screen_brightness_mode': '1',
+                  'settings get system screen_brightness': '128',
+                  'reduce_bright_colors_activated': '0'}
+
+# 13.1 正常路径：关自动亮度 -> cmd display -> 记录原值
+ops._brightness_backup = None
+calls = capture_all_adb(lambda: ops.set_screen_brightness('dev1', 20), outputs=bright_outputs)
+check("亮度：先关闭自动亮度", any('settings put system screen_brightness_mode 0' in c for c in calls),
+      str(calls))
+check("亮度：优先用 cmd display set-brightness 0.2000",
+      any('cmd display set-brightness 0.2000' in c for c in calls))
+check("亮度：已记录原亮度用于还原",
+      ops._brightness_backup and ops._brightness_backup['brightness'] == '128'
+      and ops._brightness_backup['used_cmd'] is True,
+      str(ops._brightness_backup))
+check("亮度：检查了极暗模式", any('reduce_bright_colors_activated' in c for c in calls))
+
+# 13.2 还原：写回原亮度与自动亮度模式
+calls = capture_all_adb(lambda: ops.restore_screen_brightness())
+check("还原亮度：cmd display reset-brightness", any('cmd display reset-brightness' in c for c in calls))
+check("还原亮度：写回原亮度128", any('settings put system screen_brightness 128' in c for c in calls))
+check("还原亮度：写回自动亮度模式1",
+      any('settings put system screen_brightness_mode 1' in c for c in calls))
+check("还原亮度：备份已清空（可重复调用）", ops._brightness_backup is None)
+check("还原亮度：无备份时直接返回", ops.restore_screen_brightness() is False)
+
+# 13.3 降级路径：cmd display 不支持时退回 settings（20% -> 51/255）
+ops._brightness_backup = None
+calls = capture_all_adb(lambda: ops.set_screen_brightness('dev1', 20), outputs=bright_outputs,
+                        fail_when='cmd display set-brightness')
+check("亮度降级：cmd display 失败时退回 settings 写 51",
+      any('settings put system screen_brightness 51' in c for c in calls), str(calls))
+check("亮度降级：不标记 used_cmd", ops._brightness_backup['used_cmd'] is False)
+
+# 13.4 还原时若用过 cmd display，需要 reset
+calls = capture_all_adb(lambda: ops.restore_screen_brightness())
+check("降级路径还原：不调用 cmd display reset-brightness",
+      not any('reset-brightness' in c for c in calls))
+
+# 13.5 配置项与开关
+check("默认 screen_brightness=20", analyser.screen_brightness == 20, str(analyser.screen_brightness))
+saved_device_id, saved_brightness = analyser.device_id, analyser.screen_brightness
+analyser.device_id, analyser.screen_brightness = 'dev1', 0
+ops._brightness_backup = None
+calls = capture_all_adb(lambda: analyser.apply_screen_brightness(), outputs=bright_outputs)
+check("screen_brightness=0 表示不调整（不发任何指令）",
+      analyser.apply_screen_brightness() is False and not any('screen_brightness' in c for c in calls),
+      str(calls))
+analyser.device_id, analyser.screen_brightness = saved_device_id, saved_brightness
+
+# 13.6 开启时会注册退出还原（避免测试进程真的去连 adb）
+ops._brightness_backup = None
+analyser.device_id = 'dev1'
+
+
+def _brightness_stub(cmd, **kwargs):
+    joined = ' '.join(str(c) for c in cmd)
+    out = b'1' if joined.endswith('screen_brightness_mode') else b'128'
+    return sp.CompletedProcess(args=cmd, returncode=0, stdout=out, stderr=b'')
+
+
+with mock.patch('atexit.register') as reg, mock.patch('subprocess.run', _brightness_stub):
+    applied = analyser.apply_screen_brightness()
+check("开启亮度调整时会注册退出还原", applied and reg.called)
+analyser.device_id = saved_device_id
+ops._brightness_backup = None
+
+# 13.7 极暗模式会被提示（只提醒不改设置）
+ops._brightness_backup = None
+calls = capture_all_adb(lambda: ops.set_screen_brightness('dev1', 30),
+                        outputs=dict(bright_outputs, **{'reduce_bright_colors_activated': '1'}))
+check("极暗模式下仍会完成亮度设置（只提示不阻断）",
+      any('cmd display set-brightness 0.3000' in c for c in calls)
+      and ops._brightness_backup is not None)
+ops._brightness_backup = None
 
 # ---------- 汇总 ----------
 failed = [r for r in results if not r[1]]

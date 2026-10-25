@@ -17,6 +17,7 @@ pip install pillow paddlepaddle paddleocr numpy
 7.会自动识别偏移值，不需要调整任何参数，全自动识别、运行  
   7.1.如果自动找的偏移值不对，支持在config文件中自己填写/修改偏移值  
 8.基本上大部分问题，都能从这篇文章找到答案和建议：https://www.bilibili.com/opus/1104972369516036117  
+9.挂机时会自动把屏幕亮度调低省电（默认20%），程序退出时自动还原；可在config.json的screen_brightness里调整，填0表示不调整
 
 # 安装与运行
     pip install -r requirements.txt
