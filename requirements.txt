@@ -1,0 +1,37 @@
+# 抖音福袋挂机（douyin_guaji）运行依赖
+#
+# 安装：
+#   python -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# ---------------------------------------------------------------------------
+# 版本约束（请勿随意升级；以下组合已在 Windows + Python 3.11 + CPU 环境实测通过）
+# ---------------------------------------------------------------------------
+# 1) paddleocr 必须留在 2.x
+#    代码依赖 2.x 的 ocr() 返回结构 —— [[[框坐标, (文字, 置信度)], ...]]，
+#    见 Underlying_Operations.extract_ocr_content()（取 result[0] 后逐项 item[1][0]）。
+#    PaddleOCR 3.x 改为 OCRResult / dict 结构，升级后文字识别会直接失效。
+#
+# 2) paddlepaddle 必须留在 2.x
+#    2.6.2 是最后一个提供 Python 3.11 Windows wheel 的 2.x 版本（2.6.1 无 cp311 wheel）。
+#    README 里"最新版的 paddlepaddle 可能会有问题"，指的就是 3.x 系列。
+#
+# 3) numpy
+#    实测 numpy 2.4.6 与 paddlepaddle 2.6.2 + paddleocr 2.10.0 的推理链路兼容
+#    （已验证中文 OCR 识别正确），因此不强制降到 1.x；
+#    加 <3 上界，避免未来 numpy 3.x 破坏兼容。
+#
+# 4) 首次运行 PaddleOCR() 会自动下载 PP-OCRv4 中文模型（约 15MB）到
+#    %USERPROFILE%\.paddleocr，需要联网；之后离线可用。
+#
+# 5) 本项目不自带 adb，需要系统已安装 adb 并加入 PATH，
+#    且手机已开启 USB 调试（adb devices 能看到设备）。
+#
+# 6) 安装后可用 tests/smoke_test.py 自检（不需要连接手机）：
+#    .venv\Scripts\python.exe tests\smoke_test.py
+# ---------------------------------------------------------------------------
+
+paddlepaddle==2.6.2
+paddleocr==2.10.0
+numpy>=1.26,<3
+pillow>=9.0

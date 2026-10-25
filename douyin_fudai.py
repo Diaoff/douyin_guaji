@@ -1,16 +1,15 @@
+import atexit
 import os
 import random
 import sys
 import time
+import numpy as np
 from PIL import Image
 from datetime import datetime
 from Underlying_Operations import underlying_operations
-import json
 
-"""
-    当前版本
-    V4.4
-    """
+VERSION = 'V4.4'  # 版本号唯一来源；README 里的"当前版本"需与本值保持一致
+
 
 class Tee(object):
     """重写print的函数"""
@@ -20,25 +19,54 @@ class Tee(object):
 
     def write(self, obj):
         for f in self.files:
+            if getattr(f, 'closed', False):  # 文件已关闭时跳过，避免退出阶段写入报错
+                continue
             f.write(obj)
             f.flush()
 
     def flush(self):
         for f in self.files:
+            if getattr(f, 'closed', False):
+                continue
             f.flush()
 
 
 class fudai_analyse:
     """福袋抽奖相关操作类"""
 
+    # ---- 时间窗（24小时制，闭区间）----
+    # 旧代码把边界散落写成 1<=h<=7 / h>6 / 3<=h<=6 / h>7 几种写法，语义难以对齐；
+    # 这里统一为具名常量，取值与旧版完全一致（行为不变，只消除魔法数字）。
+    NIGHT_STOP_START = 1            # 夜间停机的起始小时（含）
+    NIGHT_STOP_END = 7              # 夜间停机的结束小时（含）
+    WAKE_HOUR = 8                   # 夜间等待结束、恢复挂机的小时（= NIGHT_STOP_END + 1）
+    NO_REQUIRE_CONTENT_START = 1    # 该区间内不校验福袋内容是否是想要的
+    NO_REQUIRE_CONTENT_END = 7
+    NO_SWITCH_START = 0             # 该区间内不切换直播间
+    NO_SWITCH_END = 6
+    RESET_NO_FUDAI_START = 3        # 该区间内重置"长时间无福袋"计时
+    RESET_NO_FUDAI_END = 6
+
+    # ---- 其它阈值 ----
+    BATTERY_LOW_THRESHOLD = 30      # 低于该电量进入待机等待
+
     def __init__(self):
         self.device_id = 'xxxxxxxx'
         self.y_pianyi = 0  # 应用于不同型号手机，图标相对屏幕的高度位置有偏差
         self.resolution_ratio_x = 1080
         self.resolution_ratio_y = 2400
+        # 控制台编码保持不变，只把不可编码字符替换掉：让 README V4.4 里
+        # "修复报错：UnicodeEncodeError: 'gbk' codec can't encode character" 真正成立
+        try:
+            sys.stdout.reconfigure(errors='replace')
+        except (AttributeError, OSError, ValueError):
+            pass
         timepic = datetime.now().strftime('%Y-%m-%d-%H-%M')
         self.log_file = open(timepic + '.log', 'w', encoding='utf-8')
+        self.original_stdout = sys.stdout
         sys.stdout = Tee(sys.stdout, self.log_file)
+        atexit.register(self.close_log)  # 进程退出时关闭日志文件句柄
+        print("抖音福袋挂机 {} 启动，日志文件：{}".format(VERSION, self.log_file.name))
         self.last_find_fudai_time = 0.0
         self.last_refresh_zhibo_list_time = 0.0
         self.operation = underlying_operations()
@@ -47,101 +75,77 @@ class fudai_analyse:
         self.contains_want = self.operation.load_config("config.json", "contains_want")
         self.video_comments = self.operation.load_config("config.json", "video_comment")
         self.device_offsets = self.operation.load_config("config.json", "device_offsets")
+        # 需要处理"停止充电"弹窗的设备（如 vivo），原先硬编码在代码里
+        self.charging_notice_devices = self.operation.load_config("config.json", "charging_notice_devices")
         self.current_page_type = 1
         self.page_name = {1: "直播间页", 2: "关注的正在直播列表页", 3: "个人中心关注页", 4: "订单支付完成页",
                           5: "首页-个人中心", 6: "首页-内容推荐", 7: "下单页"}
 
+    @staticmethod
+    def in_hour_range(hour, start, end):
+        """判断小时是否落在闭区间[start, end]内；start>end 表示跨零点区间"""
+        if start <= end:
+            return start <= hour <= end
+        return hour >= start or hour <= end
 
-    def deal_robot_pic_change_color(self):
-        """处理人机验证的图片，转为黑白图"""
-        self.cut_pic(143, 884, 936, 1380, 'save', 'robot_verification')
-        path = os.path.dirname(__file__) + '/pic/save'
-        pic = path + '/robot_verification.png'
-        img = Image.open(pic)
-        img = img.convert('RGB')
-        width, height = img.size
-        for x in range(5, width - 40):
-            for y in range(20, height - 30):
-                current_color = img.getpixel((x, y))
-                if current_color[0] > 240 and current_color[1] > 240 and current_color[2] > 240:
-                    img.putpixel((x, y), (255, 255, 255))  # 白色
-                elif current_color[0] < 35 and current_color[1] < 20 and current_color[2] < 20:
-                    img.putpixel((x, y), (0, 0, 0))  # 白色
-                else:
-                    img.putpixel((x, y), (128, 128, 128))  # 黑色
-        save_pic = path + '/robot_verification_new.png'
-        img.save(save_pic)
+    def close_log(self):
+        """关闭日志文件句柄，避免长时间运行导致句柄泄漏（由atexit兜底调用）"""
+        log_file = getattr(self, 'log_file', None)
+        if log_file is None or log_file.closed:
+            return
+        try:
+            if sys.stdout is not getattr(self, 'original_stdout', None):
+                sys.stdout = self.original_stdout  # 先还原标准输出，避免后续print写入已关闭的文件
+        except Exception:
+            pass
+        try:
+            log_file.close()
+        except Exception:
+            pass
 
     def check_robot_pic_distance(self):
-        """处理人机验证的图片"""
+        """计算滑动人机验证需要滑动的距离
+
+        用 numpy 向量化重写，替代原来的逐像素双重循环（793x496 最坏情况约 33 万次
+        getpixel 调用）；判定规则与原实现完全一致：
+        1. 自上而下找到第一行里出现的第一个近白像素，作为滑动起点 (x, y)；
+        2. 在同一行从 x 向右（含 x）找第一个深色缺口像素 x1，返回 x1 - x。
+        任一步定位失败时返回 None，调用方会退回默认滑动距离。
+        """
         self.cut_pic(143, 884, 936, 1380, '', 'robot_verification')
         path = os.path.dirname(__file__) + '/pic'
         pic = path + '/robot_verification.png'
-        img = Image.open(pic)
-        img = img.convert('RGB')
-        width, height = img.size
-        printed_first_result = False  # 用于记录第一个结果是否已经输出过
-        printed_second_result = False  # 用于记录第二个结果是否已经输出过
-        for y in range(20, height - 30):
-            for x in range(5, width - 40):
-                current_color = img.getpixel((x, y))
-                if current_color[0] > 240 and current_color[1] > 240 and current_color[2] > 240:
-                    if not printed_first_result:  # 确保只输出一次第一个结果
-                        print(x, y)
-                        printed_first_result = True
-                    break
-            if printed_first_result:  # 如果已经输出过第一个结果，则退出外层循环
-                break
-        for x1 in range(x, width - 40):
-            current_color = img.getpixel((x1, y))
-            if current_color[0] < 50 and current_color[1] < 55 and current_color[2] < 85 and current_color[0] + \
-                    current_color[1] + current_color[2] < 150:
-                if not printed_second_result:  # 确保只输出一次第二个结果
-                    print(x1, y)
-                    printed_second_result = True
-                print("需要滑动的距离为{}".format(x1 - x))
-                return x1 - x
+        with Image.open(pic) as img:
+            # 转 int16：三通道求和最大 765，用 uint8 会溢出导致误判
+            arr = np.asarray(img.convert('RGB')).astype(np.int16)
 
-    def deal_robot_pic(self):
-        """处理人机验证的图片"""
-        self.cut_pic(143, 884, 936, 1380, 'save', 'robot_verification')
-        path = os.path.dirname(__file__) + '/pic/save'
-        pic = path + '/robot_verification.png'
-        img = Image.open(pic)
-        img = img.convert('RGB')
-        width, height = img.size
-        threshold = 90  # 阈值，用于判断颜色偏差是否较大
-        for x in range(5, width - 40):
-            for y in range(20, height - 30):
-                # 获取当前像素点的颜色
-                if x > 5 and y > 20 and x < width - 40 and y < height - 30:  # 跳过图片边沿的像素点
-                    # 获取当前像素点的颜色
-                    current_color = img.getpixel((x, y))
-                    # if len(current_color) != 3:
-                    #     raise ValueError(f"Invalid color format at ({x}, {y}): {current_color}")
-                    #     # 获取周围像素点的颜色
-                    num_deviant_neighbors = 0
-                    for dx in range(-1, 2):
-                        for dy in range(-1, 2):
-                            if 0 <= x + dx < width and 0 <= y + dy < height:  # 确保不超出图像边界
-                                neighbor_color = img.getpixel((x + dx, y + dy))
-                                if isinstance(neighbor_color, tuple) and len(neighbor_color) == 3:  # 检查颜色格式
-                                    neighbor_color = tuple(
-                                        min(max(int(c), 0), 255) for c in neighbor_color)  # 确保颜色值在0到255之间
-                                    channel_diffs = [abs(a - b) for a, b in zip(current_color, neighbor_color)]
-                                    # 如果每个通道的偏差都大于30，则将邻居像素点计数为偏差点
-                                    if all(diff > 70 for diff in channel_diffs):
-                                        num_deviant_neighbors += 1
-                                    # color_diff = sum(abs(a - b) for a, b in zip(current_color, neighbor_color))
-                                    # if color_diff > threshold:
-                                    #     num_deviant_neighbors += 1
-                    # 如果偏差大于阈值的邻居数量大于4，则认为是偏差点
-                    if num_deviant_neighbors > 3:
-                        img.putpixel((x, y), (255, 255, 255))  # 白色
-                    else:
-                        img.putpixel((x, y), (0, 0, 0))  # 黑色
-        save_pic = path + '/robot_verification_new.png'
-        img.save(save_pic)
+        y_lo, y_hi = 20, arr.shape[0] - 30
+        x_lo, x_hi = 5, arr.shape[1] - 40
+        region = arr[y_lo:y_hi, x_lo:x_hi]
+
+        # 1) 近白像素：nonzero 按行优先返回，取第一个即等价于原双重循环的搜索顺序
+        white = (region[:, :, 0] > 240) & (region[:, :, 1] > 240) & (region[:, :, 2] > 240)
+        rows, cols = np.nonzero(white)
+        if rows.size == 0:
+            print("未在人机验证图片中定位到滑动起点")
+            return None
+        row, col = int(rows[0]), int(cols[0])
+        x, y = col + x_lo, row + y_lo
+        print(x, y)
+
+        # 2) 同一行向右找深色缺口（含起点本身，与原实现的 range(x, ...) 对齐）
+        line = region[row]
+        dark = ((line[:, 0] < 50) & (line[:, 1] < 55) & (line[:, 2] < 85)
+                & (line[:, 0] + line[:, 1] + line[:, 2] < 150))
+        dark[:col] = False
+        dark_cols = np.nonzero(dark)[0]
+        if dark_cols.size == 0:
+            print("未在人机验证图片中定位到缺口位置")
+            return None
+        x1 = int(dark_cols[0]) + x_lo
+        print(x1, y)
+        print("需要滑动的距离为{}".format(x1 - x))
+        return x1 - x
 
     def find_fudai_detail_top_y(self):
         """找到福袋详情顶部y轴的值"""
@@ -625,15 +629,15 @@ class fudai_analyse:
             self.operation.get_screenshot(self.device_id)
             if self.check_in_zhibo_list():
                 current_hour = self.operation.get_current_hour()
-                if 1 <= current_hour <= 7:
+                if self.in_hour_range(current_hour, self.NIGHT_STOP_START, self.NIGHT_STOP_END):
                     print("等待10分钟继续检查")
                     self.operation.delay(600)  # 等待10分钟继续检查
                 else:
-                    if self.device_id == "000002f4ad09ad6e":
+                    if self.device_id in self.charging_notice_devices:
                         if self.check_stop_charging():
                             self.operation.click(self.device_id, 540, 2153)
                     if self.reflash_zhibo():  # 刷新直播间列表
-                        if current_hour > 7:  # 如果当前时间已经早上8点多了，一定有直播间了
+                        if current_hour >= self.WAKE_HOUR:  # 如果当前时间已经早上8点多了，一定有直播间了
                             self.click(290, 490)  # 点击第一个直播间
                             print("点击打开第一个直播间")
                             break  # 跳出循环，直播间已找到
@@ -664,7 +668,7 @@ class fudai_analyse:
                 print("点击打开直播间的列表")
                 self.operation.delay(2)
             else:
-                if self.device_id == "000002f4ad09ad6e":
+                if self.device_id in self.charging_notice_devices:
                     if self.check_stop_charging():
                         self.operation.click(self.device_id, 540, 2153)
                 print("当前页面不在直播间,等待10分钟后再检查")
@@ -700,7 +704,8 @@ class fudai_analyse:
 
     def check_no_fudai_time(self):
         """无福袋等待时间检查"""
-        if 3 <= self.operation.get_current_hour() <= 6:  # 如果是凌晨3-6点
+        current_hour = self.operation.get_current_hour()
+        if self.in_hour_range(current_hour, self.RESET_NO_FUDAI_START, self.RESET_NO_FUDAI_END):  # 凌晨3-6点
             self.last_find_fudai_time = 0.00
         elif self.last_find_fudai_time == 0.00 or self.last_find_fudai_time == 0:  # 如果过了不挂机时间，把当前时间赋值给上次找到福袋的时间
             self.last_find_fudai_time = time.time()
@@ -718,6 +723,9 @@ class fudai_analyse:
 
     def get_fudai_contain_and_countdown(self, top_y=1000):
         """截取福袋的内容和倒计时，并识别内容"""
+        if not isinstance(top_y, int) or isinstance(top_y, bool) or top_y <= 0:
+            print(f"福袋详情顶部坐标异常({top_y})，跳过本轮内容识别")
+            return '', ''
         self.cut_pic(390, top_y + 265,
                      1010, top_y + 475,
                      '', 'fudai_content')
@@ -734,7 +742,7 @@ class fudai_analyse:
         """检查福袋内容是否是想要，从配置文件config中读取"""
         if current_hour is None:
             current_hour = self.operation.get_current_hour()
-        if 1 <= current_hour <= 7:
+        if self.in_hour_range(current_hour, self.NO_REQUIRE_CONTENT_START, self.NO_REQUIRE_CONTENT_END):
             print("半夜不对福袋内容做要求")
             return False
         for contain in self.contains_want:
@@ -931,7 +939,14 @@ class fudai_analyse:
 
     def deal_battery_level(self):
         """针对电量不足的情况做处理"""
-        while self.operation.get_ballery_level(self.device_id) < 30:
+        while True:
+            battery_level = self.operation.get_ballery_level(self.device_id)
+            if battery_level is None:
+                # 电量读取失败时跳过本轮判定；旧实现会因 None < 30 直接抛 TypeError
+                print("电量读取失败，本轮跳过电量判定")
+                return
+            if battery_level >= self.BATTERY_LOW_THRESHOLD:
+                return
             print("设备电量较低，退出到直播列表，等待电量恢复后继续挂机")
             self.back_to_zhibo_list()
             self.operation.delay(1800)  # 挂机30分钟
@@ -945,18 +960,26 @@ class fudai_analyse:
             return True
         return False
 
-    def restart_and_reset(self):
-        """重启抖音并页面复位到直播间"""
-        self.operation.start_douyin_app(self.device_id)
-        self.operation.delay(6)  # 开屏5秒广告
-        self.deal_sign_in_gold_coins()
-        self.browse_videos()
-        if self.switch_to_focus_center():
-            self.back_to_zhibo_list()
-            self.into_zhibo_from_list()
-        else:
+    def restart_and_reset(self, max_retries=5):
+        """重启抖音并页面复位到直播间（循环重试，避免递归耗尽调用栈）
+
+        Returns:
+            bool: 是否成功把页面复位到直播间
+        """
+        for attempt in range(1, max_retries + 1):
+            self.operation.start_douyin_app(self.device_id)
+            self.operation.delay(6)  # 开屏5秒广告
+            self.deal_sign_in_gold_coins()
+            self.browse_videos()
+            if self.switch_to_focus_center():
+                self.back_to_zhibo_list()
+                self.into_zhibo_from_list()
+                return True
+            print(f"第{attempt}次启动抖音后未回到关注页，关闭应用后重试")
             self.operation.stop_douyin_app(self.device_id)
-            self.restart_and_reset()
+            self.operation.delay(10)
+        print(f"连续{max_retries}次启动抖音后仍未回到关注页，交回主流程处理")
+        return False
 
     def fudai_choujiang(self, device_id="", needswitch=False, wait_minutes=15):
         """福袋抽奖主逻辑，默认不切换直播间"""
@@ -973,10 +996,10 @@ class fudai_analyse:
 
         def handle_night_time(current_hour):
             """处理凌晨时间段"""
-            if 1 <= current_hour <= 7:
+            if self.in_hour_range(current_hour, self.NIGHT_STOP_START, self.NIGHT_STOP_END):
                 # self.back_to_zhibo_list()
                 self.operation.stop_douyin_app(self.device_id)
-                wait_time = 8-current_hour
+                wait_time = self.WAKE_HOUR - current_hour
                 print(f"已经凌晨{current_hour}点了，关闭抖音，等待{wait_time}个小时")
                 self.operation.delay(3600*wait_time)
                 self.restart_and_reset()
@@ -1004,7 +1027,9 @@ class fudai_analyse:
 
         def handle_switch_live_room(stats):
             """处理切换直播间的情况"""
-            if stats['swipe_times'] < 10 and self.operation.get_current_hour() > 6:
+            current_hour = self.operation.get_current_hour()
+            if stats['swipe_times'] < 10 and not self.in_hour_range(
+                    current_hour, self.NO_SWITCH_START, self.NO_SWITCH_END):
                 self.swipe(760, 1600, 760, 800, 200)
                 print("上划切换直播间")
                 stats['swipe_times'] += 1
@@ -1056,10 +1081,16 @@ class fudai_analyse:
             return False
 
         def get_fudai_info():
-            """获取福袋信息"""
-            self.operation.get_screenshot(self.device_id)
-            y_top = self.find_fudai_detail_top_y()
-            return self.get_fudai_contain_and_countdown(y_top)
+            """获取福袋信息：顶部坐标识别失败时重试，仍失败则返回空文本交给上层降级处理"""
+            for attempt in range(2):
+                self.operation.get_screenshot(self.device_id)
+                y_top = self.find_fudai_detail_top_y()
+                if y_top:
+                    return self.get_fudai_contain_and_countdown(y_top)
+                print(f"第{attempt + 1}次未识别到福袋详情顶部坐标，重试")
+                self.operation.delay(2)
+            print("未识别到福袋详情顶部坐标，本轮按打开福袋异常处理")
+            return '', ''
 
         def handle_fudai_content(x, stats, fudai_content_text, current_hour):
             """处理福袋内容"""

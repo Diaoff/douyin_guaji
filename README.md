@@ -18,8 +18,15 @@ pip install pillow paddlepaddle paddleocr numpy
   7.1.如果自动找的偏移值不对，支持在config文件中自己填写/修改偏移值  
 8.基本上大部分问题，都能从这篇文章找到答案和建议：https://www.bilibili.com/opus/1104972369516036117  
 
+# 安装与运行
+    pip install -r requirements.txt
+    依赖版本约束见 requirements.txt 内注释（paddleocr / paddlepaddle 必须留在 2.x 系列，勿随意升级）
+    装好之后可以先自检，不需要连接手机：python tests\smoke_test.py
+
 ## 当前版本
 V4.4版本已发布  
+    （本仓库代码对应 V4.4；下面 V4.5 及之后的条目都属于预更新内容，尚未包含在本版本代码中。
+      target_pic/ 下的超级福袋形状模板是给 V5.0+ 用的，V4.4 代码不会读取该目录。）
 
 # 版本历史&预更新内容
     V1.0
@@ -283,3 +290,8 @@ V4.4版本已发布
     8.无需任何安装与配置，生成可执行exe文件打开即运行
     其他来自充电粉丝们的建议，额外需要的功能
 # 看到最后了，白嫖成功记得点个星，也可以B站充电进QQ群！
+
+# 授权说明
+本项目未附开源许可证，保留所有权利（All rights reserved）。  
+仅限个人学习与自用；未经作者许可，不得用于商业用途或二次分发。  
+新版本获取与授权请联系 B 站「叼哥」。
