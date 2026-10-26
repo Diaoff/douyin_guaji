@@ -1477,7 +1477,9 @@ class fudai_analyse:
             if result:
                 if result == 1:
                     self.click(540, 1270)
-                    print("没有抽中，点击：我知道了，关闭弹窗")
+                    tally = self.status.add_stat('lose')
+                    print("没有抽中，点击：我知道了，关闭弹窗（累计 中奖{} 未中{}）".format(
+                        tally.get('win', 0), tally.get('lose', 0)))
                     self.operation.delay(5)
                     # 二次检验：5秒后再次判断弹窗是否仍存在，若存在则再次点击关闭
                     second_check = self.check_lucky_draw_result()
@@ -1488,18 +1490,23 @@ class fudai_analyse:
                     return True
                 elif result == 2:
                     self.click(540, 1270)
-                    print("没有抽中但获得优惠券，点击：领取并使用，关闭弹窗")
+                    tally = self.status.add_stat('lose')
+                    print("没有抽中但获得优惠券，点击：领取并使用，关闭弹窗（累计 中奖{} 未中{}）".format(
+                        tally.get('win', 0), tally.get('lose', 0)))
                     self.operation.delay(2)
                     self.click(x, 400)
                     print("点击小福袋偏上的位置，关闭店铺商品列表")
                     self.operation.delay(1)
                     return True
                 elif result == 3:  # 其他情况
-                    print("没有抽中但交互按钮未知，等待5秒后继续")
+                    # 交互按钮未知，无法确定是中了还是没中，不计数（只记日志），避免统计失真
+                    print("没有抽中但交互按钮未知，等待5秒后继续（本局不计入统计）")
                     self.operation.delay(5)
                     return False
                 else:  # 中奖了
-                    print(f"抽中奖品，开始领取，奖品确认按钮y坐标为：{result}")
+                    tally = self.status.add_stat('win')
+                    print("抽中奖品，开始领取，奖品确认按钮y坐标为：{}（累计 中奖{} 未中{}）".format(
+                        result, tally.get('win', 0), tally.get('lose', 0)))
                     self.get_reward(result)
                     return True
             return False

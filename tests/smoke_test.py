@@ -484,12 +484,15 @@ class _LoopEscape(Exception):
 
 
 def drive_main_loop(*, have_fudai=False, time_text='', switch_rounds=4,
-                    min_seconds=15, max_minutes=15, needswitch=False, max_rounds=6):
+                    min_seconds=15, max_minutes=15, needswitch=False, max_rounds=6,
+                    attend_result=None):
     """驱动真实的 fudai_choujiang 主循环，返回观察到的事件。
 
     have_fudai=False 时每轮都判定不到福袋（验证换房间计数）；
     have_fudai=True 时每轮都找到福袋，并按 time_text 走倒计时判定。
-    三处跳出点：轮次上限 / 换房间(swipe) / 参与抽奖(attend_choujiang)。
+    attend_result=None 时一到参与抽奖就跳出（验证是否参与）；
+    传 True/False 则让它继续往下走到等待开奖与开奖结果处理。
+    跳出点：轮次上限 / 换房间(swipe) / 参与抽奖(attend_choujiang)。
     """
     events = {'rounds': 0, 'swipes': 0, 'delays': [], 'participated': False}
     saved = []
@@ -513,9 +516,12 @@ def drive_main_loop(*, have_fudai=False, time_text='', switch_rounds=4,
 
     def fake_attend(*args, **kwargs):
         events['participated'] = True
-        raise _LoopEscape()
+        if attend_result is None:
+            raise _LoopEscape()
+        return attend_result
 
     patch(ops, 'delay', fake_delay)
+    patch(ops, 'random_delay', lambda *a, **k: None)   # 开奖后那段 3~7 分钟等待不能真等
     patch(ops, 'get_screenshot', lambda *a, **k: True)
     patch(ops, 'get_current_hour', lambda: 12)      # 固定白天，避开夜间停机
     patch(ops, 'click', lambda *a, **k: None)
@@ -1162,6 +1168,75 @@ analyser.read_fudai_panel, analyser.cut_pic = saved_18
 # 面板顶部坐标异常时依然安全返回
 check("面板识别：top_y 异常时不报错",
       analyser.get_fudai_contain_and_countdown(None) == ('', ''))
+
+# ---------- 19. 抽奖统计：中奖与未中都要计数 ----------
+init_stats = analyser.status.snapshot()['stats']
+check("统计项：初始就包含中奖与未中",
+      'win' in init_stats and 'lose' in init_stats, str(init_stats))
+
+# add_stat 直接验
+tally_status = FudaiStatus()
+tally_status.add_stat('win')
+tally_status.add_stat('lose')
+tally_status.add_stat('lose', 2)
+tally_snapshot = tally_status.snapshot()['stats']
+check("统计：add_stat 正确累加", (tally_snapshot['win'], tally_snapshot['lose']) == (1, 3),
+      str(tally_snapshot))
+check("统计：add_stat 返回更新后的统计", tally_status.add_stat('win')['win'] == 2,
+      str(tally_status.snapshot()['stats']))
+
+# 悬浮窗文本行
+empty_lines = format_snapshot_lines(FudaiStatus().snapshot())
+check("文本行：显示中奖/未中/合计",
+      any('中奖0  未中0  合计0' in line for line in empty_lines), str(empty_lines))
+tally_status2 = FudaiStatus()
+tally_status2.add_stat('win')
+tally_status2.add_stat('lose')
+tally_status2.add_stat('lose')
+tally_lines = [line for line in format_snapshot_lines(tally_status2.snapshot())
+               if line.startswith('抽奖统计')]
+check("文本行：中奖1 未中2 合计3",
+      tally_lines and tally_lines[0] == '抽奖统计：中奖1  未中2  合计3', str(tally_lines))
+check("文本行：队列统计全为0时不显示（不占位置）",
+      not any(line.startswith('队列统计')
+              for line in format_snapshot_lines(tally_status2.snapshot())))
+tally_status2.add_stat('missed')
+check("文本行：队列有数据时才显示队列统计",
+      any(line.startswith('队列统计')
+          for line in format_snapshot_lines(tally_status2.snapshot())))
+
+
+# 主循环联动：真的走完"参与 → 等开奖 → 处理结果"，看统计有没有涨
+def draw_delta(result_value):
+    saved_check = analyser.check_lucky_draw_result
+    saved_reward = analyser.get_reward
+    analyer_check = analyser.check_lucky_draw_result
+    analyser.check_lucky_draw_result = lambda: result_value
+    analyser.get_reward = lambda *a, **k: None
+    before = analyser.status.snapshot()['stats']
+    try:
+        drive_main_loop(have_fudai=True, time_text='0342', attend_result=True, max_rounds=1)
+    finally:
+        analyser.check_lucky_draw_result = saved_check
+        analyser.get_reward = saved_reward
+    after = analyser.status.snapshot()['stats']
+    return after['win'] - before['win'], after['lose'] - before['lose']
+
+
+delta_lose = draw_delta(1)                 # 1 = 没有抽中
+check("主循环：没抽中时未中计数 +1（旧版本完全不计数）",
+      delta_lose == (0, 1), str(delta_lose))
+delta_win = draw_delta(1438)               # 返回 y 坐标 = 中奖
+check("主循环：中奖时中奖计数 +1", delta_win == (1, 0), str(delta_win))
+delta_coupon = draw_delta(2)               # 2 = 没中但给了优惠券，也算未中
+check("主循环：没中但得优惠券也算未中", delta_coupon == (0, 1), str(delta_coupon))
+delta_unknown = draw_delta(3)              # 3 = 交互按钮未知，不计数以免统计失真
+check("主循环：结果未知时不计数（避免统计失真）", delta_unknown == (0, 0), str(delta_unknown))
+
+# 统计能同时反映中奖与未中（累计展示）
+final_stats = analyser.status.snapshot()['stats']
+check("累计统计同时包含中奖与未中",
+      final_stats['win'] >= 1 and final_stats['lose'] >= 2, str(final_stats))
 
 # ---------- 汇总 ----------
 failed = [r for r in results if not r[1]]

@@ -63,7 +63,8 @@ class FudaiStatus:
             'phase': '启动中',
             'draw_ts': 0.0,     # 正在等开奖的那个福袋的开奖时间戳；0 = 当前没在等
             'pending': [],      # 多房间队列里的任务 [{'room','prize','draw_ts'}, ...]
-            'stats': {'done': 0, 'missed': 0, 'dropped': 0},
+            # win/lose = 抽奖结果统计（未中的也要记）；done/missed/dropped = 多房间队列任务统计
+            'stats': {'win': 0, 'lose': 0, 'done': 0, 'missed': 0, 'dropped': 0},
             'updated_ts': 0.0,
         }
 
@@ -104,6 +105,13 @@ class FudaiStatus:
         with self._lock:
             self._data['stats'].update(stats)
             self._data['updated_ts'] = self._now()
+
+    def add_stat(self, key, delta=1):
+        """累加一个统计值，返回更新后的完整统计（方便随日志一起打印）"""
+        with self._lock:
+            self._data['stats'][key] = self._data['stats'].get(key, 0) + delta
+            self._data['updated_ts'] = self._now()
+            return dict(self._data['stats'])
 
     # ---- 读取 ----
     def snapshot(self):
@@ -160,6 +168,10 @@ def format_snapshot_lines(snapshot, include_countdown=True):
             lines.append('   {}  {}'.format(
                 format_countdown(item.get('remaining')), item.get('room') or '-'))
     stats = snapshot.get('stats') or {}
-    lines.append('统计：完成{}  错过{}  放弃{}'.format(
-        stats.get('done', 0), stats.get('missed', 0), stats.get('dropped', 0)))
+    win, lose = stats.get('win', 0), stats.get('lose', 0)
+    lines.append('抽奖统计：中奖{}  未中{}  合计{}'.format(win, lose, win + lose))
+    # 队列统计只在多房间功能真的产生过任务时才显示，免得一直挂个 0 占位置
+    if any(stats.get(key, 0) for key in ('done', 'missed', 'dropped')):
+        lines.append('队列统计：完成{}  错过{}  放弃{}'.format(
+            stats.get('done', 0), stats.get('missed', 0), stats.get('dropped', 0)))
     return lines
