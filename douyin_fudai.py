@@ -118,6 +118,7 @@ class fudai_analyse:
                           5: "首页-个人中心", 6: "首页-内容推荐", 7: "下单页"}
         self._init_multi_room()
         self._init_overlay()
+        self._init_draw_wait()
 
     def _init_overlay(self):
         """悬浮窗配置（仅影响显示，不影响挂机逻辑）"""
@@ -1226,6 +1227,75 @@ class fudai_analyse:
                 return item
         return None
 
+    # 开奖后的随机静默等待（规避风控）。
+    # 旧实现硬编码 random_delay(180, 420) —— 3~7 分钟纯睡觉、完全不看屏幕，
+    # 实测因此整整错过一个倒计时几分钟的福袋。现在时长可配、并且等待期间会探路。
+    DEFAULT_AFTER_DRAW_WAIT_MIN = 30
+    DEFAULT_AFTER_DRAW_WAIT_MAX = 90
+    DEFAULT_AFTER_DRAW_WAIT_CHECK = 30
+
+    def _init_draw_wait(self):
+        """开奖后的等待时长（秒）与等待期间的探路间隔"""
+        self.after_draw_wait_min = self._load_int_config(
+            "after_draw_wait_min", self.DEFAULT_AFTER_DRAW_WAIT_MIN, 0, 1800)
+        self.after_draw_wait_max = self._load_int_config(
+            "after_draw_wait_max", self.DEFAULT_AFTER_DRAW_WAIT_MAX, 0, 1800)
+        if self.after_draw_wait_max < self.after_draw_wait_min:
+            print("after_draw_wait_max({}) 小于 min({})，按 min 处理".format(
+                self.after_draw_wait_max, self.after_draw_wait_min))
+            self.after_draw_wait_max = self.after_draw_wait_min
+        self.after_draw_wait_check = self._load_int_config(
+            "after_draw_wait_check_seconds", self.DEFAULT_AFTER_DRAW_WAIT_CHECK, 5, 600)
+
+    def quick_check_have_fudai(self):
+        """快速看一眼当前直播间有没有福袋（一次截图 + 一次颜色扫描）
+
+        比完整的 check_have_fudai（最多 5 次截图、每次隔 1.5 秒）轻得多，
+        专门给"开奖后等待"期间探路用。
+        """
+        self.operation.get_screenshot(self.device_id)
+        pic_path = os.path.dirname(__file__) + '/pic/screenshot.png'
+        try:
+            with Image.open(pic_path) as pic:
+                arr = np.asarray(pic.convert('RGB')).astype(np.int16)
+        except Exception as e:
+            print(e)
+            return False
+        hit = self.find_fudai_icon(arr)
+        if not hit:
+            return False
+        self.fudai_hit = hit
+        self.last_find_fudai_time = time.time()
+        print("发现福袋：本机像素 x={} y={}".format(hit[0], hit[1]))
+        return True
+
+    def pause_after_draw(self):
+        """开奖后的随机静默等待：规避风控，但不再"瞎等"
+
+        旧实现是 random_delay(180, 420) 一次性睡 3~7 分钟，期间完全不看屏幕，
+        结果就是短倒计时的福袋必然被错过（用户实测：等完 400 秒后那个福袋已经没了）。
+
+        现在：总时长可配（默认 30~90 秒），按 after_draw_wait_check 分片，
+        每片结束快速看一眼有没有福袋，有就提前结束等待。
+        Returns:
+            int: 实际等待的秒数
+        """
+        total = random.randint(self.after_draw_wait_min, self.after_draw_wait_max)
+        if total <= 0:
+            print("开奖后等待已配置为 0 秒，直接继续找福袋")
+            return 0
+        print("开奖后随机等待{}秒（规避风控），期间每{}秒看一眼有没有新福袋".format(
+            total, self.after_draw_wait_check))
+        waited = 0
+        while waited < total:
+            chunk = min(self.after_draw_wait_check, total - waited)
+            self.operation.delay(chunk)
+            waited += chunk
+            if self.quick_check_have_fudai():
+                print("等待期间发现福袋，提前结束等待（已等{}秒/计划{}秒）".format(waited, total))
+                return waited
+        return waited
+
     def check_lucky_draw_result(self):
         """判定福袋抽奖的结果
 
@@ -1623,7 +1693,7 @@ class fudai_analyse:
             have_clicked_no_award = handle_lucky_draw(x)
             if have_clicked_no_award:
                 if not needswitch:
-                    self.operation.random_delay(180, 420)
+                    self.pause_after_draw()
                     return False
                 else:
                     self.swipe(760, 1600, 760, 800, 200)

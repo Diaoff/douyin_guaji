@@ -1355,6 +1355,94 @@ check("偏移值：测试后已恢复原状",
       open(config_path, 'rb').read() == config_before
       and ops.load_device_offsets().get('smoke-test-device') is None)
 
+# ---------- 22. 开奖后的等待：不再瞎等（旧实现硬编码 180~420 秒）----------
+saved_22 = (ops.delay, analyser.quick_check_have_fudai,
+            analyser.after_draw_wait_min, analyser.after_draw_wait_max,
+            analyser.after_draw_wait_check)
+
+
+def run_pause(waited_delays, min_s, max_s, check_s, finds_at=None, rounds=1):
+    """驱动 pause_after_draw：finds_at 指定第几次探路时"发现福袋" """
+    record = {'delays': [], 'checks': 0}
+
+    def fake_delay(seconds=1):
+        record['delays'].append(seconds)
+
+    def fake_quick_check():
+        record['checks'] += 1
+        return finds_at is not None and record['checks'] >= finds_at
+
+    ops.delay = fake_delay
+    analyser.quick_check_have_fudai = fake_quick_check
+    analyser.after_draw_wait_min = min_s
+    analyser.after_draw_wait_max = max_s
+    analyser.after_draw_wait_check = check_s
+    try:
+        actual = analyser.pause_after_draw()
+    finally:
+        (ops.delay, analyser.quick_check_have_fudai, analyser.after_draw_wait_min,
+         analyser.after_draw_wait_max, analyser.after_draw_wait_check) = saved_22
+    return actual, record
+
+
+actual, rec = run_pause(None, 60, 60, 30)
+check("开奖后等待：按片等待，总时长不超上限",
+      actual == 60 and rec['delays'] == [30, 30], "{} {}".format(actual, rec['delays']))
+check("开奖后等待：每片结束都探路一次", rec['checks'] == 2, str(rec['checks']))
+
+actual, rec = run_pause(None, 60, 60, 30, finds_at=1)
+check("开奖后等待：发现福袋就提前结束（不等满）",
+      actual == 30 and rec['delays'] == [30] and rec['checks'] == 1,
+      "{} {} {}".format(actual, rec['delays'], rec['checks']))
+
+actual, rec = run_pause(None, 0, 0, 30)
+check("开奖后等待：配置为 0 时完全不等待",
+      actual == 0 and rec['delays'] == [] and rec['checks'] == 0,
+      "{} {}".format(actual, rec['delays']))
+
+actual, rec = run_pause(None, 90, 90, 100)
+check("开奖后等待：探路间隔大于总时长时只等一片",
+      actual == 90 and rec['delays'] == [90] and rec['checks'] == 1,
+      "{} {} {}".format(actual, rec['delays'], rec['checks']))
+
+check("开奖后等待：默认值已从硬编码的180~420改短",
+      (analyser.DEFAULT_AFTER_DRAW_WAIT_MIN, analyser.DEFAULT_AFTER_DRAW_WAIT_MAX) == (30, 90),
+      "{}/{}".format(analyser.DEFAULT_AFTER_DRAW_WAIT_MIN, analyser.DEFAULT_AFTER_DRAW_WAIT_MAX))
+check("开奖后等待：配置项已生效",
+      (analyser.after_draw_wait_min, analyser.after_draw_wait_max,
+       analyser.after_draw_wait_check) == (30, 90, 30),
+      "{}/{}/{}".format(analyser.after_draw_wait_min, analyser.after_draw_wait_max,
+                        analyser.after_draw_wait_check))
+def has_hardcoded_draw_wait(path):
+    """AST 级检查：只认真正的 random_delay(180, 420) 调用，注释里的字样不算"""
+    tree = ast.parse(open(path, encoding='utf-8').read())
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'random_delay'):
+            continue
+        values = [arg.value for arg in node.args if isinstance(arg, ast.Constant)]
+        if values == [180, 420]:
+            return True
+    return False
+
+
+check("开奖后等待：主循环里已不再硬编码 random_delay(180, 420)",
+      not has_hardcoded_draw_wait(os.path.join(REPO_ROOT, 'douyin_fudai.py')))
+
+# 探路函数本身：找到福袋时要更新"上次找到福袋时间"，避免被 30 分钟兜底误判
+saved_22b = (ops.get_screenshot, analyser.find_fudai_icon, analyser.last_find_fudai_time)
+ops.get_screenshot = lambda *a, **k: True
+analyser.find_fudai_icon = lambda arr: (60, 466)
+analyser.last_find_fudai_time = 0.0
+with mock.patch.object(df_module, '__file__', os.path.join(off_dir, 'douyin_fudai.py')), \
+        mock.patch.object(uo_module, '__file__', os.path.join(off_dir, 'Underlying_Operations.py')), \
+        mock.patch('PIL.Image.open', lambda *a, **k: Image.new('RGB', (1280, 2772), (10, 10, 10))):
+    quick_found = analyser.quick_check_have_fudai()
+check("探路：发现福袋时返回 True 并更新时间戳",
+      quick_found is True and analyser.fudai_hit == (60, 466)
+      and analyser.last_find_fudai_time > 0, str(analyser.fudai_hit))
+(ops.get_screenshot, analyser.find_fudai_icon, analyser.last_find_fudai_time) = saved_22b
+
 # ---------- 汇总 ----------
 failed = [r for r in results if not r[1]]
 print("\n===== 冒烟结果: %d/%d 通过 =====" % (len(results) - len(failed), len(results)))

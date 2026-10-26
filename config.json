@@ -67,5 +67,9 @@
     "overlay_enabled": true,
     "_note_overlay_alpha": "悬浮窗不透明度百分比(20~100)，越小越透明。注意整窗半透明会让文字也一起变淡，调太低会看不清",
     "overlay_alpha_percent": 78,
-    "overlay_log_lines": 10
+    "overlay_log_lines": 10,
+    "_note_after_draw_wait": "开奖后随机等待多少秒再看下一个福袋(规避风控)。原作者硬编码180~420秒纯睡觉，实测会因为等太久错过短倒计时的福袋，故改短；两个都写0=不等待。等待期间每 after_draw_wait_check_seconds 秒看一眼有没有新福袋，有就提前结束等待",
+    "after_draw_wait_min": 30,
+    "after_draw_wait_max": 90,
+    "after_draw_wait_check_seconds": 30
 }
