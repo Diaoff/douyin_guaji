@@ -37,7 +37,8 @@
         "This is so creative and well-made!"
     ],
     "device_offsets": {
-        "XXXXXXX": -50
+        "XXXXXXX": -50,
+        "7ade6544": 0
     },
     "_note_charging_notice_devices": "需要处理系统'停止充电'弹窗的设备序列号(如vivo机型)，即 adb devices 里看到的编号；不需要该判定就留空数组 []",
     "charging_notice_devices": [

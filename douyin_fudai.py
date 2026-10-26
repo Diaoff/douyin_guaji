@@ -1035,27 +1035,32 @@ class fudai_analyse:
         def click_attend_button(keywords, label):
             """在按钮带识别出的文字里找到真正的按钮行，点它的中心
 
-            旧实现不管按钮在哪都点固定位置 (500,2060)：按钮一旦不在那儿就点空，
-            表现就是"按钮文字没匹配上/参与不了"。
-
             选行的启发式（来自真机实测数据）：按钮是**短标签**并且位于面板**底部**，
             而任务描述/广告是长句子且在上面。实测同一屏里：
                 '发送评论：右上角领券，1+2号合并付！到手318元'  y=2374 宽867  ← 任务描述
                 '一键发表评论'                                y=2525 宽292  ← 真按钮
-            所以先按长度过滤掉长句子，再在剩下的里面取最靠下的那行。
+
+            Returns:
+                True  = 已经点了（点到了按钮行，或完全认不出文字时盲点兜底一次）
+                False = 只看到长句描述、没有按钮行 —— 此时**不点击**，交给状态判定，
+                        否则就会像实测日志那样点到"发送评论：…到手318元"这种说明文字上
             """
             candidates = [item for item in attend_boxes
                           if any(word in item['text'] for word in keywords)]
-            if candidates:
-                short_labels = [item for item in candidates if len(item['text']) <= self.ATTEND_LABEL_MAX_CHARS]
-                pool = short_labels or candidates
-                target = max(pool, key=lambda item: item['y'])
+            short_labels = [item for item in candidates
+                            if len(item['text']) <= self.ATTEND_LABEL_MAX_CHARS]
+            if short_labels:
+                target = max(short_labels, key=lambda item: item['y'])
                 print("{}：点击 ({}, {}) 处的「{}」（候选{}个）".format(
                     label, target['x'], target['y'], target['text'], len(candidates)))
                 self.operation.click(self.device_id, target['x'], target['y'])
-            else:
-                print("{}：按钮带里没定位到按钮行，退回固定位置点击".format(label))
-                self.click(500, 2060)
+                return True
+            if candidates:
+                print("{}：只找到长句描述、没找到按钮行，不点击（避免点错）".format(label))
+                return False
+            print("{}：按钮带里没有可用文字，退回固定位置盲点一次".format(label))
+            self.click(500, 2060)
+            return True
 
         def handle_comment_task():
             """点完"发表评论"类按钮后，如果弹出的是评论输入界面，就真的发一条评论
@@ -1094,16 +1099,23 @@ class fudai_analyse:
             return None
             
         def handle_participation_buttons():
-            """处理参与按钮情况"""
+            """处理参与按钮情况
+
+            注意：没真正点到按钮时返回 None，让后面的状态判定接手
+            （实测"已参与过"的面板上，任务说明里也含"评论"二字，会被误当成参与按钮）
+            """
             if "评论" in attend_button_text or "参与抽奖" in attend_button_text:
-                click_attend_button(("评论", "参与抽奖"), "点击参与抽奖")
+                if not click_attend_button(("评论", "参与抽奖"), "点击参与抽奖"):
+                    return None
                 self.operation.delay(2)
                 return True
             elif "开始观看" in attend_button_text:
-                click_attend_button(("开始观看",), "点击开始观看直播，参与抽奖")
+                if not click_attend_button(("开始观看",), "点击开始观看直播，参与抽奖"):
+                    return None
                 return True
             elif "粉丝团" in attend_button_text:
-                click_attend_button(("粉丝团",), "点击加入粉丝团、点亮粉丝团")
+                if not click_attend_button(("粉丝团",), "点击加入粉丝团、点亮粉丝团"):
+                    return None
                 self.operation.delay(2)
                 close_fudai_detail()
                 return False
@@ -1117,6 +1129,12 @@ class fudai_analyse:
                 return True
             elif "还需看播" in attend_button_text:
                 print("已经参与，等待看播时间凑齐开奖")
+                close_fudai_detail()
+                return True
+            elif "任务已完成" in attend_button_text or "请勿离开直播间" in attend_button_text:
+                # 真机实测这种面板就是"已参与、等开奖"的状态，面板上是任务说明而非按钮，
+                # 以前会因为没有按钮而被判成"没匹配上"，白等一轮还会被切走
+                print("任务已完成，已经在等待开奖")
                 close_fudai_detail()
                 return True
             elif "无法参与" in attend_button_text:
@@ -1171,27 +1189,74 @@ class fudai_analyse:
         print("参与抽奖多次点击失败")
         return False
 
-    def check_lucky_draw_result(self):
-        """判定福袋抽奖的结果"""
+    # 开奖结果弹窗的识别区域（1080x2400 基准，横向全宽，两条带覆盖上中下）
+    # 旧实现用三个固定裁剪（结果文字 655-755 / 确认按钮 1200-1350 / 中奖协议 1438-1490），
+    # 在非等比缩放的机型上全部落空：实测某 1280x2772 手机上 lucky_draw_result 那块
+    # 裁出来 OCR 是空字符串 → check_lucky_draw_result() 永远 False →
+    # 后果不只是统计不加，而是**中奖也领不到**（日志里从来没有任何开奖结果记录）。
+    RESULT_BANDS = ((0, 200, 1080, 1050), (0, 1050, 1080, 1900))
+    # 中奖/未中奖的标题文字很大，用"文字高度"把直播间的滚动评论排除掉，
+    # 免得观众打一句"没中奖"就被误判成本局结果
+    RESULT_TITLE_MIN_HEIGHT = 35
+    RESULT_NO_WIN_KEYWORDS = ('没有抽中', '未中奖', '很遗憾', '没抽中')
+    RESULT_WIN_KEYWORDS = ('抽中福袋', '恭喜中奖', '恭喜你中奖')
+    RESULT_COUPON_KEYWORDS = ('领取并使用',)
+    RESULT_CONFIRM_KEYWORDS = ('我知道了',)
+    RESULT_AGREEMENT_KEYWORDS = ('已阅读', '同意')
+    RESULT_DEFAULT_AGREEMENT_Y = 1438      # 认不到协议行时的兜底位置（基准坐标）
+
+    def read_result_bands(self):
+        """OCR 开奖结果弹窗可能出现的区域，把所有文字行汇总返回（y 为本机像素）"""
         self.operation.get_screenshot(self.device_id)
-        self.cut_pic(350, 655, 740, 755, '', 'lucky_draw_result')  # 没有抽中福袋位置
-        lucky_draw_result = self.operation.analyse_pic_word('lucky_draw_result')
-        if "没有抽中" in lucky_draw_result:
-            self.cut_pic(340, 1200, 730, 1350, '', 'no_award_confirm')  # 我知道了按钮的位置
-            no_award_confirm = self.operation.analyse_pic_word('no_award_confirm')
-            if "我知道了" in no_award_confirm:
-                return 1
-            elif "领取并使用" in no_award_confirm:
+        boxes = []
+        for index, band in enumerate(self.RESULT_BANDS):
+            name = 'draw_result{}'.format(index)
+            self.cut_pic(*band, '', name)
+            part = self.operation.analyse_pic_word_with_boxes(name)
+            origin_y = band[1] * self.resolution_ratio_y // 2400
+            for item in part:
+                item['y'] += origin_y
+            boxes.extend(part)
+        return boxes
+
+    @staticmethod
+    def _match_title(boxes, keywords, min_height):
+        """在识别结果里找命中关键词的标题行（要求文字足够大）"""
+        for item in boxes:
+            if item.get('h', 0) >= min_height and any(word in item['text'] for word in keywords):
+                return item
+        return None
+
+    def check_lucky_draw_result(self):
+        """判定福袋抽奖的结果
+
+        Returns:
+            1: 没有抽中（点"我知道了"）
+            2: 没有抽中但给了优惠券（点"领取并使用"）
+            3: 弹窗在，但按钮/协议文字没认出来（不猜，只记日志）
+            int: 中奖，返回"已阅读协议"那一行的基准 y
+            False: 当前没有开奖结果弹窗
+        """
+        boxes = self.read_result_bands()
+        text = ''.join(item['text'] for item in boxes)
+        if text:
+            # 每次都把这块区域的文字打进日志：万一还是认不出来，日志里就有现场可查
+            print("开奖结果区域文字：{}".format(text))
+
+        if self._match_title(boxes, self.RESULT_NO_WIN_KEYWORDS, self.RESULT_TITLE_MIN_HEIGHT):
+            if any(word in text for word in self.RESULT_COUPON_KEYWORDS):
                 return 2
+            if any(word in text for word in self.RESULT_CONFIRM_KEYWORDS):
+                return 1
             return 3
-        elif "抽中福袋" in lucky_draw_result:
+
+        if self._match_title(boxes, self.RESULT_WIN_KEYWORDS, self.RESULT_TITLE_MIN_HEIGHT):
             print("恭喜中奖了！")
-            y_value = [1438, 1490]
-            for y in y_value:
-                self.cut_pic(280, y - 30, 660, y + 30, '', 'have_read_user_agreement')  # 已经阅读并同意用户协议
-                have_read_user_agreement = self.operation.analyse_pic_word('have_read_user_agreement')
-                if "已阅读" in have_read_user_agreement:
-                    return y
+            for item in sorted(boxes, key=lambda box: box['y']):
+                if any(word in item['text'] for word in self.RESULT_AGREEMENT_KEYWORDS):
+                    return int(item['y'] * 2400 / self.resolution_ratio_y)
+            print("中奖弹窗里没认出协议勾选行，用兜底位置")
+            return self.RESULT_DEFAULT_AGREEMENT_Y
         return False
 
     def check_have_reward_notice_confirm(self):
@@ -1499,8 +1564,8 @@ class fudai_analyse:
                     self.operation.delay(1)
                     return True
                 elif result == 3:  # 其他情况
-                    # 交互按钮未知，无法确定是中了还是没中，不计数（只记日志），避免统计失真
-                    print("没有抽中但交互按钮未知，等待5秒后继续（本局不计入统计）")
+                    # 认不出按钮文字：既不能断定没中、也不能断定中了，所以不计数、也不瞎点
+                    print("开奖弹窗内容无法确定（没认出中奖也没认出未中奖），等待5秒后继续（本局不计入统计）")
                     self.operation.delay(5)
                     return False
                 else:  # 中奖了

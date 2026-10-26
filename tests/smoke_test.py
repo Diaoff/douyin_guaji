@@ -1238,6 +1238,76 @@ final_stats = analyser.status.snapshot()['stats']
 check("累计统计同时包含中奖与未中",
       final_stats['win'] >= 1 and final_stats['lose'] >= 2, str(final_stats))
 
+# ---------- 20. 开奖结果判定：宽区域 + 关键词（修复"永远判定不出结果"）----------
+def result_boxes(*lines, height=60):
+    """把 (文本, 高度) 变成 check_lucky_draw_result 需要的坐标框"""
+    return [{'text': text, 'x': 540, 'y': 1300 + index * 100, 'w': 400,
+             'h': (h if h is not None else height), 'score': 0.9}
+            for index, (text, h) in enumerate(lines)]
+
+
+def judge_result(boxes):
+    saved_read = analyser.read_result_bands
+    analyser.read_result_bands = lambda *a, **k: list(boxes)
+    try:
+        return analyser.check_lucky_draw_result()
+    finally:
+        analyser.read_result_bands = saved_read
+
+
+check("开奖判定：没有抽中 + 我知道了 -> 1",
+      judge_result(result_boxes(('没有抽中', 60), ('我知道了', 40))) == 1)
+check("开奖判定：没有抽中 + 领取并使用 -> 2",
+      judge_result(result_boxes(('没有抽中', 60), ('领取并使用', 40))) == 2)
+check("开奖判定：只有标题、按钮没认出 -> 3（不猜）",
+      judge_result(result_boxes(('没有抽中', 60))) == 3)
+check("开奖判定：抽中福袋 -> 返回协议行的基准 y",
+      judge_result(result_boxes(('抽中福袋', 60), ('已阅读并同意用户协议', 40))) == 1300 + 100)
+check("开奖判定：中奖但认不到协议行 -> 用兜底位置",
+      judge_result(result_boxes(('抽中福袋', 60))) == analyser.RESULT_DEFAULT_AGREEMENT_Y)
+check("开奖判定：没有弹窗 -> False",
+      judge_result(result_boxes(('说点什么...', 30), ('直播间商品', 30))) is False)
+check("开奖判定：空区域 -> False", judge_result([]) is False)
+
+# 直播间滚动评论里出现"没中奖"这种小字，不能被当成本局结果
+check("开奖判定：小字评论里的'没中奖'不误判",
+      judge_result(result_boxes(('没中奖', 22))) is False
+      and judge_result(result_boxes(('没中奖', 22), ('我知道了', 40))) is False)
+check("开奖判定：大标题'未中奖'能认出来",
+      judge_result(result_boxes(('未中奖', 60), ('我知道了', 40))) == 1)
+
+# 坐标换算：两条带各自的 y 偏移都要加上（用 1280x2772 才能验出换算，基准分辨率下偏移恰好等于带起点）
+saved_20 = (analyser.cut_pic, ops.analyse_pic_word_with_boxes, ops.get_screenshot,
+            analyser.resolution_ratio_x, analyser.resolution_ratio_y)
+analyser.resolution_ratio_x, analyser.resolution_ratio_y = 1280, 2772
+analyser.cut_pic = lambda *a, **k: True
+ops.get_screenshot = lambda *a, **k: True
+ops.analyse_pic_word_with_boxes = lambda name, mode=0: (
+    [{'text': '带0', 'x': 10, 'y': 50, 'w': 100, 'h': 40, 'score': 0.9}] if name == 'draw_result0'
+    else [{'text': '带1', 'x': 10, 'y': 50, 'w': 100, 'h': 40, 'score': 0.9}])
+band_boxes = analyser.read_result_bands()
+expect_band0 = 200 * 2772 // 2400          # = 231
+expect_band1 = 1050 * 2772 // 2400         # = 1212
+check("开奖判定：两条带的 y 偏移分别换算正确",
+      [b['y'] for b in band_boxes] == [50 + expect_band0, 50 + expect_band1],
+      str([b['y'] for b in band_boxes]))
+(analyser.cut_pic, ops.analyse_pic_word_with_boxes, ops.get_screenshot,
+ analyser.resolution_ratio_x, analyser.resolution_ratio_y) = saved_20
+
+# 已参与过的面板：带里只有任务说明，不能点它，要认成"已参与等开奖"
+rec = run_attend('加入购物粉丝团已达成发送评论：右上角领券，1+2号合并付！到手318元已达成请勿离开直播间，否则会失去抽奖资格哦',
+                 [{'text': '发送评论：右上角领券，1+2号合并付！到手318元', 'x': 515, 'y': 2373,
+                   'w': 867, 'h': 60, 'score': 0.9}])
+check("已参与面板：不点任务说明长句（真机日志回归）",
+      (515, 2373) not in rec['clicks'], str(rec['clicks']))
+check("已参与面板：识别为已参与、等待开奖", rec['result'] is True, str(rec['result']))
+
+# 关键词被拆到两个框里（只有拼接文本才含关键字）时，退回固定位置盲点一次
+rec = run_attend('参与抽奖', [{'text': '参与', 'x': 100, 'y': 2500, 'w': 60, 'h': 40, 'score': 0.9},
+                          {'text': '抽奖', 'x': 200, 'y': 2500, 'w': 60, 'h': 40, 'score': 0.9}])
+check("关键词被拆框、找不到整行按钮时：退回固定位置盲点一次",
+      rec['result'] is True and any(c == (500, 2060) for c in rec['clicks']), str(rec['clicks']))
+
 # ---------- 汇总 ----------
 failed = [r for r in results if not r[1]]
 print("\n===== 冒烟结果: %d/%d 通过 =====" % (len(results) - len(failed), len(results)))
