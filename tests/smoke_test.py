@@ -690,6 +690,479 @@ check("极暗模式下仍会完成亮度设置（只提示不阻断）",
       and ops._brightness_backup is not None)
 ops._brightness_backup = None
 
+# ---------- 14. 多房间排队：时间窗与冲突裁决 ----------
+from fudai_queue import FudaiTask, FudaiTaskQueue  # noqa: E402
+
+# 14.1 时间窗与基本流程
+q = FudaiTaskQueue(arrive_margin=60, result_margin=40)
+t = FudaiTask('房间A', '鱼竿', draw_ts=1000, created_ts=900)
+accepted, reason = q.add(t)
+check("入队：无冲突时有保障", accepted and t.guaranteed, reason)
+check("时间窗 = [开奖-arrive, 开奖+result]", t.window_start == 940 and t.window_end == 1040,
+      f"{t.window_start}~{t.window_end}")
+check("未到回房窗口时不该出发", q.due(900) is None)
+check("到达回房窗口时选中该任务", q.due(940) is t)
+
+# 14.2 核心：开奖时间相近（差30秒）怎么裁决
+q2 = FudaiTaskQueue(arrive_margin=60, result_margin=40, conflict_policy='earlier_first')
+a = FudaiTask('房间A', '鱼竿', draw_ts=1000, created_ts=900)
+b = FudaiTask('房间B', '鱼竿', draw_ts=1030, created_ts=900)   # 只差30秒 -> 窗口重叠
+q2.add(a)
+ok_b, reason_b = q2.add(b)
+check("相近开奖：先开奖的A保持有保障", a.guaranteed is True)
+check("相近开奖：后开奖的B降级为伺机而不是丢弃",
+      ok_b and b.guaranteed is False and b.state == 'pending', reason_b)
+check("相近开奖：B带上了降级原因", '降级' in b.reason, b.reason)
+check("相近开奖：到点只去A", q2.due(940) is a)
+q2.mark_serving(a)
+q2.finish(a, 'done')
+missed = q2.purge_expired(1071)          # B 的窗口 end = 1030+40 = 1070
+check("A服务完后B已错过 -> 标记missed", b.state == 'missed' and b in missed)
+check("错过的任务可事后去消息中心补领", b in q2.missed_tasks())
+
+# 14.3 后加入的更早开奖，应该反过来取代
+q3 = FudaiTaskQueue(arrive_margin=60, result_margin=40)
+late = FudaiTask('房间B', 'x', draw_ts=1030, created_ts=900)
+early = FudaiTask('房间A', 'y', draw_ts=1000, created_ts=900)
+q3.add(late)
+q3.add(early)
+check("后加入但开奖更早的应取得保障权", early.guaranteed and not late.guaranteed)
+
+# 14.4 valuable_first：价值高的优先，哪怕开奖更晚
+q4 = FudaiTaskQueue(arrive_margin=60, result_margin=40, conflict_policy='valuable_first')
+plain = FudaiTask('房间A', '普通奖品', draw_ts=1000, created_ts=900, value=1)
+wanted = FudaiTask('房间B', '想要的鱼竿', draw_ts=1030, created_ts=900, value=2)
+q4.add(plain)
+q4.add(wanted)
+check("valuable_first：命中想要的优先（可晚开奖）", wanted.guaranteed and not plain.guaranteed)
+
+# 14.5 skip_new：窗口冲突干脆不参与
+q5 = FudaiTaskQueue(arrive_margin=60, result_margin=40, conflict_policy='skip_new')
+q5.add(FudaiTask('房间A', 'x', draw_ts=1000, created_ts=900))
+ok5, reason5 = q5.add(FudaiTask('房间B', 'y', draw_ts=1030, created_ts=900))
+check("skip_new：窗口冲突时不参与", ok5 is False and 'skip_new' in reason5, reason5)
+
+# 14.6 队列上限与伺机任务的安全余量
+q6 = FudaiTaskQueue(max_pending=1)
+q6.add(FudaiTask('房间A', 'x', draw_ts=1000, created_ts=900))
+ok6, reason6 = q6.add(FudaiTask('房间B', 'y', draw_ts=9000, created_ts=900))
+check("队列达上限时不再接单", ok6 is False and '队列已满' in reason6, reason6)
+
+q7 = FudaiTaskQueue(arrive_margin=60, result_margin=40, travel_budget=45)
+guard = FudaiTask('房间G', 'x', draw_ts=1590, created_ts=1500)   # 有保障，窗口1530开始
+q7.add(guard)
+spare = FudaiTask('房间S', 'y', draw_ts=1510, created_ts=1400)
+spare.guaranteed = False                                        # 手动摆一个伺机任务
+spare.window_start, spare.window_end = q7._window(spare.draw_ts)
+q7.tasks.append(spare)
+check("伺机任务可能耽误下一个有保障任务时就不去", q7.due(1500) is None)
+
+# 14.7 房名归一化
+check("房名归一化：去标点空格表情",
+      analyser.room_key_from_title("小明【直播中】 🎉") == "小明直播中",
+      analyser.room_key_from_title("小明【直播中】 🎉"))
+check("房名归一化：截断到8个字符",
+      len(analyser.room_key_from_title("一二三四五六七八九十")) == 8)
+check("房名归一化：空输入返回空", analyser.room_key_from_title("") == "")
+
+# 14.8 带坐标的 OCR（供"按名找房"使用）
+# 注意：这里用自己的图，不能复用 11.1 的 say_something.png ——
+# 11.3 节会调用真实的 find_y_offset，从空白 screenshot 裁剪并覆盖那个文件名。
+boxes_img = Image.new("RGB", (170, 42), (250, 250, 250))
+ImageDraw.Draw(boxes_img).text((3, 5), "说点什么...",
+                               font=ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", 24),
+                               fill=(150, 150, 150))
+boxes_img.save(os.path.join(off_dir, "pic", "boxes_probe.png"))
+with mock.patch.object(uo_module, "__file__", os.path.join(off_dir, "Underlying_Operations.py")):
+    boxes = ops.analyse_pic_word_with_boxes("boxes_probe")
+check("boxes：能拿到文本与中心坐标",
+      bool(boxes) and any('说点' in item['text'] for item in boxes), str(boxes))
+check("boxes：坐标落在裁剪图范围内",
+      all(0 <= item['x'] <= 170 and 0 <= item['y'] <= 42 for item in boxes), str(boxes))
+with mock.patch.object(ops, '_load_pic_for_ocr', lambda *a, **k: np.zeros((10, 10))), \
+        mock.patch.object(ops.ocr, 'ocr', lambda img: [None]):
+    check("boxes：OCR 返回 [None] 时得空列表", ops.analyse_pic_word_with_boxes('x') == [])
+with mock.patch.object(ops, '_load_pic_for_ocr', lambda *a, **k: np.zeros((10, 10))), \
+        mock.patch.object(ops.ocr, 'ocr', lambda img: None):
+    check("boxes：OCR 返回 None 时得空列表", ops.analyse_pic_word_with_boxes('x') == [])
+
+
+def run_find_room(screens, room_key='小明', max_scrolls=2):
+    """用伪造的逐屏 OCR 结果驱动 find_room_in_follow_list"""
+    result = {'clicks': 0, 'scrolls': 0}
+    queue_screens = list(screens)
+    saved = (ops.get_screenshot, ops.analyse_pic_word_with_boxes, ops.click, ops.delay,
+             analyser.swipe, analyser.cut_pic)
+
+    def fake_boxes(*args, **kwargs):
+        return queue_screens.pop(0) if queue_screens else []
+
+    ops.get_screenshot = lambda *a, **k: True
+    ops.analyse_pic_word_with_boxes = fake_boxes
+    ops.click = lambda *a, **k: result.__setitem__('clicks', result['clicks'] + 1)
+    ops.delay = lambda *a, **k: None
+    analyser.swipe = lambda *a, **k: result.__setitem__('scrolls', result['scrolls'] + 1)
+    analyser.cut_pic = lambda *a, **k: True
+    try:
+        found = analyser.find_room_in_follow_list(room_key, max_scrolls=max_scrolls)
+    finally:
+        (ops.get_screenshot, ops.analyse_pic_word_with_boxes, ops.click, ops.delay,
+         analyser.swipe, analyser.cut_pic) = saved
+    return found, result
+
+
+found, stat = run_find_room([[{'text': '别人家', 'x': 100, 'y': 300, 'score': 0.9},
+                             {'text': '小明直播中', 'x': 540, 'y': 800, 'score': 0.9}]])
+check("按名找房：命中即点击", found and stat['clicks'] == 1 and stat['scrolls'] == 0, str(stat))
+found, stat = run_find_room([[], [{'text': '小明', 'x': 200, 'y': 500, 'score': 0.9}]], max_scrolls=2)
+check("按名找房：首屏没有则滚动后命中", found and stat['clicks'] == 1 and stat['scrolls'] == 1,
+      str(stat))
+found, stat = run_find_room([[], []], max_scrolls=1)
+check("按名找房：找不到时返回False且滚动次数受限", found is False and stat['scrolls'] == 1,
+      str(stat))
+
+# 14.9 配置项默认值（实验性功能默认关闭）
+check("多房间功能默认关闭", analyser.multi_room_enabled is False)
+check("队列参数已从config读取",
+      analyser.arrive_margin_seconds == 60 and analyser.result_margin_seconds == 40
+      and analyser.conflict_policy == 'earlier_first' and analyser.max_pending_fudai == 5,
+      f"{analyser.arrive_margin_seconds}/{analyser.result_margin_seconds}/"
+      f"{analyser.conflict_policy}/{analyser.max_pending_fudai}")
+
+# ---------- 15. 悬浮窗：日志总线、状态快照、倒计时与降级 ----------
+from fudai_status import (LogBus, FudaiStatus, format_countdown,  # noqa: E402
+                          format_snapshot_lines)
+import fudai_overlay as overlay_module  # noqa: E402
+
+# 15.1 LogBus：print 的写入不保证整行到达，要能跨块拼接
+check("LogBus：容量有最小值保护（防止把环形缓冲设得过小）", LogBus(max_lines=1).max_lines == 10,
+      str(LogBus(max_lines=1).max_lines))
+bus = LogBus(max_lines=12)
+bus.write('第一行\n第二')
+bus.write('行\n')
+bus.write('半行没有换行')
+# 还没遇到换行的半行不应该出现在缓冲区里
+check("LogBus：未结束的半行先攒着不显示", bus.tail(10) == ['第一行', '第二行'], str(bus.tail(10)))
+bus.write('\n')          # 补上换行，半行才落库
+check("LogBus：补换行后落库", bus.tail(10) == ['第一行', '第二行', '半行没有换行'],
+      str(bus.tail(10)))
+for i in range(20):
+    bus.write('第{}条\n'.format(i))
+check("LogBus：环形缓冲不超过上限", len(bus.tail(100)) == 12, str(len(bus.tail(100))))
+check("LogBus：tail 取的是最后N行", bus.tail(2) == ['第18条', '第19条'], str(bus.tail(2)))
+bus.clear()
+check("LogBus：可清空", bus.tail(5) == [])
+
+# 15.2 FudaiStatus：倒计时在查询时刻计算（注入 now_fn 保证可测）
+fake_now = {'t': 1000.0}
+status = FudaiStatus(now_fn=lambda: fake_now['t'])
+check("状态：初始没有在等的福袋", status.snapshot()['remaining'] is None)
+status.set_draw(1060, prize='鱼竿')
+check("状态：剩余秒数=开奖-现在", status.snapshot()['remaining'] == 60,
+      str(status.snapshot()['remaining']))
+fake_now['t'] = 1100.0
+check("状态：时间推进后剩余归零而不是负数", status.snapshot()['remaining'] == 0)
+status.clear_draw()
+check("状态：清空后回到没有在等", status.snapshot()['remaining'] is None)
+fake_now['t'] = 1200.0
+status.set_pending([{'room': '房间A', 'prize': 'x', 'draw_ts': 1260},
+                    {'room': '房间B', 'prize': 'y', 'draw_ts': 1320}])
+check("状态：队列里每个任务各自算剩余时间",
+      [item['remaining'] for item in status.snapshot()['pending']] == [60, 120],
+      str(status.snapshot()['pending']))
+status.set_stats(done=3, missed=1)
+check("状态：统计可更新",
+      status.snapshot()['stats']['done'] == 3 and status.snapshot()['stats']['missed'] == 1)
+snapshot_copy = status.snapshot()
+snapshot_copy['phase'] = '被外部改了'
+check("状态：快照是副本，改动不影响内部", status.snapshot()['phase'] != '被外部改了')
+
+# 15.3 倒计时格式化
+check("倒计时格式化：None -> --:--", format_countdown(None) == '--:--')
+check("倒计时格式化：0 -> 00:00", format_countdown(0) == '00:00')
+check("倒计时格式化：65 -> 01:05", format_countdown(65) == '01:05')
+check("倒计时格式化：3661 -> 1:01:01", format_countdown(3661) == '1:01:01')
+check("倒计时格式化：负数按0处理", format_countdown(-5) == '00:00')
+
+# 15.4 悬浮窗文本行
+lines = format_snapshot_lines(status.snapshot())
+check("文本行：默认包含倒计时", any(line.startswith('开奖倒计时') for line in lines), str(lines))
+check("文本行：可省略倒计时（悬浮窗单独大字显示）",
+      not any(line.startswith('开奖倒计时')
+              for line in format_snapshot_lines(status.snapshot(), include_countdown=False)))
+check("文本行：显示排队任务", any('排队中 2 个' in line for line in lines), str(lines))
+check("文本行：未识别房名时不显示房间行",
+      not any(line.startswith('当前房间') for line in lines), str(lines))
+
+# 15.5 Tee 与日志总线真的连通
+tee_bus = LogBus()
+Tee(io.StringIO(), bus=tee_bus).write('喂给总线的内容\n')
+check("Tee：写入同时进总线", tee_bus.tail(1) == ['喂给总线的内容'], str(tee_bus.tail(1)))
+check("运行过程中确实有日志进了总线（启动阶段已连通）",
+      len(analyser.log_bus.tail(400)) > 0, str(len(analyser.log_bus.tail(400))))
+
+# 15.6 悬浮窗：无图形环境必须安全降级，有图形环境则真建一次
+probe_status = FudaiStatus()
+probe_bus = LogBus()
+with mock.patch.object(overlay_module, 'tk', None):
+    check("没有 tkinter 时 create_overlay 返回 None 而不是抛异常",
+          overlay_module.create_overlay(probe_status, probe_bus) is None)
+
+overlay = overlay_module.create_overlay(probe_status, probe_bus,
+                                        alpha=0.8, log_lines=4, poll_ms=100000)
+if overlay is None:
+    check("悬浮窗：无图形环境，跳过实际创建", True, "无显示环境")
+else:
+    try:
+        probe_bus.write('悬浮窗内日志1\n悬浮窗内日志2\n')
+        probe_status.set_draw(time.time() + 90, prize='测试奖品')
+        probe_status.set_phase('单元测试中')
+        overlay.update_once()
+        countdown_text = overlay.countdown_label.cget('text')
+        log_text = overlay.log_label.cget('text')
+        info_text = overlay.info_label.cget('text')
+        check("悬浮窗：窗口可创建", bool(overlay.root.winfo_exists()))
+        check("悬浮窗：倒计时控件是 mm:ss", len(countdown_text) == 5 and ':' in countdown_text,
+              countdown_text)
+        check("悬浮窗：日志控件显示日志", '悬浮窗内日志1' in log_text, repr(log_text))
+        check("悬浮窗：信息区显示奖品与状态",
+              '测试奖品' in info_text and '单元测试中' in info_text, repr(info_text))
+        check("悬浮窗：整窗半透明已设置",
+              abs(float(overlay.root.attributes('-alpha')) - 0.8) < 0.01,
+              str(overlay.root.attributes('-alpha')))
+        check("悬浮窗：无边框且置顶",
+              bool(overlay.root.overrideredirect()) and bool(overlay.root.attributes('-topmost')))
+    finally:
+        overlay.close()
+    check("悬浮窗：可正常关闭", True)
+
+# 15.7 与主循环联动：真的等到开奖时才登记倒计时
+analyser.status.clear_draw()
+drive_main_loop(have_fudai=True, time_text='0342')
+snap_waited = analyser.status.snapshot()
+check("主循环联动：等到开奖时登记倒计时与奖品",
+      snap_waited['draw_ts'] > 0 and snap_waited['prize'] == '鱼竿大奖',
+      str({key: snap_waited[key] for key in ('draw_ts', 'prize', 'phase')}))
+check("主循环联动：阶段已上报", bool(snap_waited['phase']), snap_waited['phase'])
+analyser.status.clear_draw()
+drive_main_loop(have_fudai=True, time_text='0008')      # 倒计时太短被拦下
+check("主循环联动：被倒计时窗口拦下时不登记倒计时",
+      analyser.status.snapshot()['draw_ts'] == 0,
+      str(analyser.status.snapshot()['draw_ts']))
+
+# ---------- 16. 福袋图标识别：纵向带扫描（修复"差1像素就漏"）----------
+FUDAI_TEST_W, FUDAI_TEST_H = 1280, 2772      # 用户手机的真实分辨率
+TARGET_PURPLE = (188, 186, 241)              # 落在 FUDAI_COLOR 范围内的颜色
+
+
+def is_target_color(color):
+    return (183 <= color[0] <= 193 and 172 <= color[1] <= 193 and 237 <= color[2] <= 248)
+
+
+def build_screen(icon_px=None, size=(FUDAI_TEST_W, FUDAI_TEST_H)):
+    """造一张背景截图，可选在指定本机像素位置画一小块目标色"""
+    im = Image.new('RGB', size, (200, 200, 202))
+    if icon_px:
+        x, y = icon_px
+        ImageDraw.Draw(im).rectangle([x, y, x + 4, y + 2], fill=TARGET_PURPLE)
+    return im
+
+
+saved_ratio = (analyser.resolution_ratio_x, analyser.resolution_ratio_y)
+analyser.resolution_ratio_x, analyser.resolution_ratio_y = FUDAI_TEST_W, FUDAI_TEST_H
+
+# 16.1 真实故障场景：旧逻辑只探 y=465，而图标紫色从 y=466 开始
+screen_arr = np.asarray(build_screen((60, 466)).convert('RGB')).astype(np.int16)
+probe_y = int(403 * FUDAI_TEST_H / 2400)                       # = 465
+old_probe_hit = any(
+    is_target_color(tuple(int(v) for v in screen_arr[probe_y, x]))
+    for x in range(int(33 * FUDAI_TEST_W / 1080), int(52 * FUDAI_TEST_W / 1080)))
+check("（对照）旧的单行探测在本场景确实漏掉", not old_probe_hit)
+hit = analyser.find_fudai_icon(screen_arr)
+check("纵向带扫描：图标从 y=466 起也能找到", hit is not None, str(hit))
+# 画的是 x60-64/y466-468 的矩形，质心落在正中 (62,467)
+check("纵向带扫描：命中点是图标色块的质心 (62,467)", hit == (62, 467), str(hit))
+if hit:
+    hit_color = tuple(int(v) for v in screen_arr[hit[1], hit[0]])
+    check("返回的命中点本身就是目标色像素（保证点得准）",
+          is_target_color(hit_color), str(hit_color))
+
+# 16.2 搜索带边界（基准 403±35 -> 本机 y 424~505）
+for label, icon_px, expect in [
+        ("带内顶部 y=430", (60, 430), True),
+        ("带内底部 y=500", (60, 500), True),
+        ("带外偏下 y=520", (60, 520), False),
+        ("带外偏上 y=410", (60, 410), False),
+        ("带外偏右 x=600", (600, 466), False),
+        ("带外偏左 x=20", (20, 466), False)]:
+    case_arr = np.asarray(build_screen(icon_px).convert('RGB')).astype(np.int16)
+    got = analyser.find_fudai_icon(case_arr)
+    check("搜索带边界：{} -> {}".format(label, "找到" if expect else "不找"),
+          (got is not None) is expect, str(got))
+
+# 16.3 没有福袋时不能误报
+check("纯背景截图不会误报",
+      analyser.find_fudai_icon(np.asarray(build_screen(None).convert('RGB')).astype(np.int16))
+      is None)
+
+# 16.4 完整 check_have_fudai：返回基准 x，并把本机像素坐标记下来供点击
+fudai_dir = os.path.join(tempfile.gettempdir(), 'dsh_fudai_hit_test')
+os.makedirs(os.path.join(fudai_dir, 'pic'), exist_ok=True)
+build_screen((60, 466)).save(os.path.join(fudai_dir, 'pic', 'screenshot.png'))
+saved_16 = (analyser.device_id, analyser.device_offsets, analyser.fudai_hit)
+analyser.device_id = 'fudai-hit-test'
+analyser.device_offsets = {'fudai-hit-test': 0}     # 防止测试真的去写 config.json
+analyser.fudai_hit = None
+with mock.patch.object(df_module, '__file__', os.path.join(fudai_dir, 'douyin_fudai.py')), \
+        mock.patch.object(uo_module, '__file__', os.path.join(fudai_dir, 'Underlying_Operations.py')), \
+        mock.patch.object(ops, 'get_screenshot', lambda *a, **k: True), \
+        mock.patch.object(ops, 'delay', lambda *a, **k: None):
+    found_x = analyser.check_have_fudai()
+check("check_have_fudai：带扫描后能返回命中的基准 x", found_x == 52, str(found_x))
+check("check_have_fudai：记下的是本机像素坐标（点击不再来回换算）",
+      analyser.fudai_hit == (62, 467), str(analyser.fudai_hit))
+analyser.device_id, analyser.device_offsets, analyser.fudai_hit = saved_16
+analyser.resolution_ratio_x, analyser.resolution_ratio_y = saved_ratio
+
+# ---------- 17. 参与按钮：宽区域扫描 + 按坐标点击（修复"按钮文字没匹配上"）----------
+analyser.resolution_ratio_x, analyser.resolution_ratio_y = 1280, 2772
+ATTEND_ORIGIN_Y = 1860 * 2772 // 2400          # 按钮带在设备像素里的起点 y = 2148
+
+# 17.1 read_attend_button：把裁剪区内的坐标换算成绝对设备像素
+saved_17 = (analyser.cut_pic, ops.analyse_pic_word_with_boxes)
+analyser.cut_pic = lambda *a, **k: True
+ops.analyse_pic_word_with_boxes = lambda name, mode=0: [
+    {'text': '参与抽奖', 'x': 100, 'y': 50, 'w': 200, 'h': 40, 'score': 0.9}]
+band_text, band_boxes = analyser.read_attend_button()
+check("按钮带：文本拼接正确", band_text == '参与抽奖', band_text)
+check("按钮带：坐标换算成绝对设备像素",
+      band_boxes[0]['x'] == 100 and band_boxes[0]['y'] == 50 + ATTEND_ORIGIN_Y,
+      str(band_boxes[0]))
+analyser.cut_pic, ops.analyse_pic_word_with_boxes = saved_17
+
+# 17.2 attend_choujiang：按识别到的坐标点击，而不是固定位置
+def run_attend(band_text, band_boxes, comment_ui=False):
+    """驱动一次 attend_choujiang，记录点击坐标与输入内容"""
+    record = {'clicks': [], 'inputs': []}
+    saved = (ops.click, ops.get_screenshot, ops.delay, ops.input_text,
+             analyser.read_attend_button, analyser.check_can_send_comment,
+             ops.get_device_resolution)
+    ops.click = lambda dev, x, y: record['clicks'].append((x, y))
+    ops.get_screenshot = lambda *a, **k: True
+    ops.delay = lambda *a, **k: None
+    ops.input_text = lambda dev, text: record['inputs'].append(text)
+    analyser.read_attend_button = lambda *a, **k: (band_text, list(band_boxes))
+    analyser.check_can_send_comment = lambda: comment_ui
+    try:
+        record['result'] = analyser.attend_choujiang()
+    finally:
+        (ops.click, ops.get_screenshot, ops.delay, ops.input_text,
+         analyser.read_attend_button, analyser.check_can_send_comment,
+         ops.get_device_resolution) = saved
+    return record
+
+
+# 按钮在 y=2600（旧实现固定点 (500*1.185, 2060*1.155) ≈ (592,2379)，根本点不到这里）
+rec = run_attend('参与抽奖', [{'text': '参与抽奖', 'x': 540, 'y': 2600, 'w': 320, 'h': 70,
+                            'score': 0.9}])
+check("参与按钮：按识别到的坐标点击（不再点固定位置）",
+      rec['result'] is True and rec['clicks'] and rec['clicks'][0] == (540, 2600),
+      str(rec['clicks'][:2]))
+
+# 多个候选行时：按钮是短标签且在底部，任务描述/广告是长句（用真机实测数据）
+rec = run_attend('短代！任务加入购物粉丝团已达成发送评论：右上角领券，1+2号合并付！到手318元未达成一键发表评论',
+                 [{'text': '发送评论：右上角领券，1+2号合并付！到手318元', 'x': 518, 'y': 2374,
+                   'w': 867, 'h': 60, 'score': 0.9},
+                  {'text': '一键发表评论', 'x': 642, 'y': 2525, 'w': 292, 'h': 72, 'score': 0.9}])
+check("参与按钮：长句描述不会被当成按钮（真机数据回归）",
+      rec['clicks'] and rec['clicks'][0] == (642, 2525), str(rec['clicks'][:2]))
+
+# "一键发表评论"这类任务：关键字命中的是"评论"，点击后若出现评论输入界面就发一条
+rec = run_attend('一键发表评论', [{'text': '一键发表评论', 'x': 540, 'y': 2650, 'w': 360,
+                              'h': 72, 'score': 0.9}], comment_ui=True)
+check("一键发表评论：能识别并点击按钮",
+      rec['result'] is True and rec['clicks'] and rec['clicks'][0] == (540, 2650),
+      str(rec['clicks'][:2]))
+check("一键发表评论：弹出评论界面时会真的发一条评论",
+      len(rec['inputs']) == 1, str(rec['inputs']))
+rec = run_attend('一键发表评论', [{'text': '一键发表评论', 'x': 540, 'y': 2650, 'w': 360,
+                              'h': 72, 'score': 0.9}], comment_ui=False)
+check("一键发表评论：没有评论界面时不乱输入",
+      rec['inputs'] == [], str(rec['inputs']))
+
+# 完全没匹配上时不能乱点，并且如实返回失败
+rec = run_attend('领券，1+2号合并付！到手318', [{'text': '领券，1+2号合并付！到手318',
+                                        'x': 600, 'y': 2400, 'w': 400, 'h': 60, 'score': 0.9}])
+check("广告文字不会误触发参与（如实返回失败且不点击）",
+      rec['result'] is False and rec['clicks'] == [], str(rec['clicks']))
+
+# 17.3 OCR 坐标框现在带宽高（供上面的"取最宽"启发式使用）
+with mock.patch.object(uo_module, "__file__", os.path.join(off_dir, "Underlying_Operations.py")):
+    probe_boxes = ops.analyse_pic_word_with_boxes("boxes_probe")
+check("OCR 坐标框带 w/h 字段",
+      bool(probe_boxes) and all('w' in b and 'h' in b and b['w'] > 0 and b['h'] > 0
+                                for b in probe_boxes), str(probe_boxes))
+analyser.resolution_ratio_x, analyser.resolution_ratio_y = saved_ratio
+
+# ---------- 18. 开奖倒计时识别：按文字形态找，不依赖位置 ----------
+# 用例全部来自真机日志里实际出现过的 OCR 结果
+for raw, expect_min, expect_sec in [
+        ('13 : 47大容量立体多功育', 13, 47),
+        ('12 : 11大容量立体多功育', 12, 11),
+        ('13:47', 13, 47),
+        ('03：42', 3, 42),
+        ('倒计时 09 : 05 后开奖', 9, 5)]:
+    boxes = [{'text': raw, 'x': 800, 'y': 1700, 'w': 200, 'h': 40, 'score': 0.9}]
+    found = analyser.find_countdown_text(boxes)
+    parsed = analyser.operation.check_countdown(found)
+    check("倒计时形态识别：{!r} -> {}秒".format(raw, expect_min * 60 + expect_sec),
+          bool(found) and parsed and parsed[0] == expect_min * 60 + expect_sec,
+          "{!r} -> {!r}".format(found, parsed and parsed[0]))
+
+# 真机日志里"读不到倒计时"的那些情况，不能被误判成倒计时
+for raw in ['丝塔美自修次红部缘护一变盛库', '炸专场可以直接', '货正品保障',
+            '发送评论：右上角领券，1+2号合并付！到手318元']:
+    found = analyser.find_countdown_text(
+        [{'text': raw, 'x': 500, 'y': 2200, 'w': 800, 'h': 60, 'score': 0.9}])
+    check("倒计时形态识别：商品描述不会被误判 -> {!r}".format(raw[:12]), found == '', repr(found))
+
+# 倒计时在面板里的位置变了也能找到（这正是旧实现失效的场景）
+moved_boxes = [{'text': '9.9参考价值', 'x': 400, 'y': 1650, 'w': 200, 'h': 40, 'score': 0.9},
+               {'text': '11 : 26', 'x': 900, 'y': 1780, 'w': 150, 'h': 40, 'score': 0.9},
+               {'text': '任务', 'x': 200, 'y': 2210, 'w': 100, 'h': 40, 'score': 0.9}]
+found = analyser.find_countdown_text(moved_boxes)
+check("倒计时位置变化后仍能找到（旧固定裁剪会漏）",
+      found == '11 : 26' and analyser.operation.check_countdown(found)[0] == 686,
+      "{!r}".format(found))
+
+# 多个候选时取最短的那行（真机数据："14 : 39" vs 粘着商品描述的 "10 : 36大容量立体多功育"）
+mixed_boxes = [{'text': '10 : 36大容量立体多功育', 'x': 900, 'y': 1700, 'w': 400, 'h': 40,
+                'score': 0.9},
+               {'text': '14 : 39', 'x': 900, 'y': 1780, 'w': 150, 'h': 40, 'score': 0.9}]
+mixed_found = analyser.find_countdown_text(mixed_boxes)
+check("倒计时形态识别：多候选取最短的那行（避免粘上商品描述）",
+      mixed_found == '14 : 39' and analyser.operation.check_countdown(mixed_found)[0] == 879,
+      "{!r}".format(mixed_found))
+
+# get_fudai_contain_and_countdown：内容会排除任务/按钮/倒计时那几行
+saved_18 = (analyser.read_fudai_panel, analyser.cut_pic)
+analyser.read_fudai_panel = lambda top_y, mode=0: [
+    {'text': '鱼竿套装', 'x': 500, 'y': 1700, 'w': 300, 'h': 50, 'score': 0.9},
+    {'text': '08 : 30', 'x': 900, 'y': 1780, 'w': 150, 'h': 40, 'score': 0.9},
+    {'text': '任务', 'x': 200, 'y': 2210, 'w': 100, 'h': 40, 'score': 0.9},
+    {'text': '一键发表评论', 'x': 640, 'y': 2525, 'w': 290, 'h': 70, 'score': 0.9}]
+content_text, countdown_text = analyser.get_fudai_contain_and_countdown(1345)
+check("面板识别：倒计时取到 08:30", countdown_text == '08 : 30', repr(countdown_text))
+check("面板识别：内容只保留奖品行，排除任务与按钮",
+      content_text == '鱼竿套装', repr(content_text))
+check("面板识别：内容不含任务/按钮字样",
+      '任务' not in content_text and '评论' not in content_text, repr(content_text))
+analyser.read_fudai_panel, analyser.cut_pic = saved_18
+
+# 面板顶部坐标异常时依然安全返回
+check("面板识别：top_y 异常时不报错",
+      analyser.get_fudai_contain_and_countdown(None) == ('', ''))
+
 # ---------- 汇总 ----------
 failed = [r for r in results if not r[1]]
 print("\n===== 冒烟结果: %d/%d 通过 =====" % (len(results) - len(failed), len(results)))

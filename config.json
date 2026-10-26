@@ -51,5 +51,20 @@
     "min_countdown_seconds": 15,
     "max_countdown_minutes": 15,
     "_note_screen_brightness": "挂机时把屏幕亮度调低省电，单位百分比(1~100)，0=不调整。亮度属于背光级设置，不改变截图内容，所以不影响OCR和颜色判定；程序退出时会自动还原原亮度。若系统开了'极暗/额外调光'会压暗画面内容并影响识别，程序会提示",
-    "screen_brightness": 20
+    "screen_brightness": 20,
+    "_note_multi_room": "多房间排队抢福袋(实验性，默认关闭)。开启后参与完一个福袋不原地等开奖，而是登记开奖时间后去别的房间继续找，快到点时再回对应直播间。开启前请先用 tools/probe_device.py 在真机上标定房名区域与关注列表坐标",
+    "multi_room_enabled": false,
+    "_note_queue_margins": "arrive_margin_seconds: 开奖前多久必须开始往回赶(回房+等页面稳定的预算)。result_margin_seconds: 开奖后还要占用多久(等弹窗+领奖+下单+退回来)。两者决定任务时间窗，窗口重叠即视为冲突",
+    "arrive_margin_seconds": 60,
+    "result_margin_seconds": 40,
+    "_note_conflict_policy": "开奖时间相近时的裁决：earlier_first=先开奖的优先(默认)；valuable_first=命中contains_want的优先；skip_new=窗口冲突就不参与。落败的一个不丢弃，而是降级为'伺机'(有保障的任务失败时它还能顶上)",
+    "conflict_policy": "earlier_first",
+    "max_pending_fudai": 5,
+    "_note_room_title_click_offset_y": "在关注列表里点击命中房名时的纵向微调像素(负数向上)，真机标定用",
+    "room_title_click_offset_y": 0,
+    "_note_overlay": "半透明置顶悬浮窗：显示开奖倒计时与实时运行日志。无图形环境(服务器/SSH)或Python不带tkinter时会自动退回纯控制台运行；也可用 --no-gui 参数强制关闭",
+    "overlay_enabled": true,
+    "_note_overlay_alpha": "悬浮窗不透明度百分比(20~100)，越小越透明。注意整窗半透明会让文字也一起变淡，调太低会看不清",
+    "overlay_alpha_percent": 78,
+    "overlay_log_lines": 10
 }

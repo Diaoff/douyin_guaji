@@ -352,8 +352,8 @@ class underlying_operations:
         pic.crop((left_up[0], left_up[1], right_down[0], right_down[1])).save(cut_pic_path)
         return True
 
-    def analyse_pic_word(self, picname='', change_color=0):
-        """识别图像中的文字, change_color=1或2为不同的二值化模式，其他不做处理"""
+    def _load_pic_for_ocr(self, picname='', change_color=0):
+        """读取裁剪图并做与 analyse_pic_word 相同的预处理，返回 numpy 数组"""
         path = os.path.dirname(__file__) + '/pic'
         if picname == '':
             pic = path + '/cut.png'
@@ -365,12 +365,48 @@ class underlying_operations:
             img = img.point(lambda x: 0 if x < 128 else 255)  # 二值化
         elif change_color == 2:
             img = img.point(lambda x: 0 if x < 180 else 255)  # 二值化
-        # img.save(pic)
-        # img.show()
-        img_np = np.array(img)  # 将 Image 对象转换为 numpy 数组
-        result = self.ocr.ocr(img_np)
+        return np.array(img)  # 将 Image 对象转换为 numpy 数组
+
+    def analyse_pic_word(self, picname='', change_color=0):
+        """识别图像中的文字, change_color=1或2为不同的二值化模式，其他不做处理"""
+        result = self.ocr.ocr(self._load_pic_for_ocr(picname, change_color))
         # OCR 在异常/空图时可能返回 None、[None] 或 [[]]，统一由 extract_ocr_content 兜底
         return self.extract_ocr_content(result)
+
+    def analyse_pic_word_with_boxes(self, picname='', change_color=0, min_score=0.0):
+        """识别文字并返回每段文字及其中心坐标
+
+        用于"按房间名在关注列表里找到卡片并点进去"这类**需要位置**的场景：
+        普通的 analyse_pic_word 只返回拼接后的文本，拿不到坐标。
+
+        注意：返回的坐标是**裁剪图内的像素坐标**，调用方需自行加上裁剪区域左上角的偏移。
+
+        Returns:
+            list[dict]: [{'text': 文本, 'x': 中心x, 'y': 中心y, 'score': 置信度}, ...]
+        """
+        result = self.ocr.ocr(self._load_pic_for_ocr(picname, change_color))
+        if not result or not result[0]:
+            return []
+        boxes = []
+        for item in result[0]:
+            try:
+                polygon, (recognized_text, score) = item[0], item[1]
+            except (IndexError, TypeError, ValueError):
+                continue
+            if not recognized_text or float(score) < min_score:
+                continue
+            try:
+                xs = [float(point[0]) for point in polygon]
+                ys = [float(point[1]) for point in polygon]
+            except (TypeError, ValueError, IndexError):
+                continue
+            boxes.append({'text': recognized_text,
+                          'x': int(sum(xs) / len(xs)),
+                          'y': int(sum(ys) / len(ys)),
+                          'w': int(max(xs) - min(xs)),
+                          'h': int(max(ys) - min(ys)),
+                          'score': float(score)})
+        return boxes
 
     def extract_ocr_content(self, content=None):
         """对OCR识别到的内容进行取值和拼接，变成完整的一段内容

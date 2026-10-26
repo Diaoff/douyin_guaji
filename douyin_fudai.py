@@ -1,23 +1,32 @@
 import atexit
 import os
 import random
+import re
 import sys
 import time
 import numpy as np
 from PIL import Image
 from datetime import datetime
 from Underlying_Operations import underlying_operations
+from fudai_queue import FudaiTask, FudaiTaskQueue
+from fudai_status import FudaiStatus, LogBus
 
 VERSION = 'V4.4'  # 版本号唯一来源；README 里的"当前版本"需与本值保持一致
 
 
 class Tee(object):
-    """重写print的函数"""
+    """重写print的函数：把输出同时写到控制台、日志文件与悬浮窗的日志总线"""
 
-    def __init__(self, *files):
+    def __init__(self, *files, bus=None):
         self.files = files
+        self.bus = bus
 
     def write(self, obj):
+        if self.bus is not None:
+            try:
+                self.bus.write(obj)
+            except Exception:
+                pass  # 日志总线出问题绝不能影响正常输出
         for f in self.files:
             if getattr(f, 'closed', False):  # 文件已关闭时跳过，避免退出阶段写入报错
                 continue
@@ -64,6 +73,7 @@ class fudai_analyse:
     def __init__(self):
         self.device_id = 'xxxxxxxx'
         self.y_pianyi = 0  # 应用于不同型号手机，图标相对屏幕的高度位置有偏差
+        self.fudai_hit = None  # 最近一次命中的福袋图标位置（1080x2400 基准坐标）
         self.resolution_ratio_x = 1080
         self.resolution_ratio_y = 2400
         # 控制台编码保持不变，只把不可编码字符替换掉：让 README V4.4 里
@@ -74,8 +84,11 @@ class fudai_analyse:
             pass
         timepic = datetime.now().strftime('%Y-%m-%d-%H-%M')
         self.log_file = open(timepic + '.log', 'w', encoding='utf-8')
+        # 日志总线与运行状态：悬浮窗（另一个线程）从这里读，必须在装 Tee 之前建好
+        self.log_bus = LogBus()
+        self.status = FudaiStatus()
         self.original_stdout = sys.stdout
-        sys.stdout = Tee(sys.stdout, self.log_file)
+        sys.stdout = Tee(sys.stdout, self.log_file, bus=self.log_bus)
         atexit.register(self.close_log)  # 进程退出时关闭日志文件句柄
         print("抖音福袋挂机 {} 启动，日志文件：{}".format(VERSION, self.log_file.name))
         self.last_find_fudai_time = 0.0
@@ -103,6 +116,33 @@ class fudai_analyse:
         self.current_page_type = 1
         self.page_name = {1: "直播间页", 2: "关注的正在直播列表页", 3: "个人中心关注页", 4: "订单支付完成页",
                           5: "首页-个人中心", 6: "首页-内容推荐", 7: "下单页"}
+        self._init_multi_room()
+        self._init_overlay()
+
+    def _init_overlay(self):
+        """悬浮窗配置（仅影响显示，不影响挂机逻辑）"""
+        self.overlay_enabled = self._load_bool_config("overlay_enabled", True)
+        self.overlay_alpha_percent = self._load_int_config("overlay_alpha_percent", 78, 20, 100)
+        self.overlay_log_lines = self._load_int_config("overlay_log_lines", 10, 3, 30)
+
+    def _init_multi_room(self):
+        """多房间排队抢福袋的相关配置（实验性，默认关闭）"""
+        self.multi_room_enabled = self._load_bool_config("multi_room_enabled", False)
+        self.arrive_margin_seconds = self._load_int_config("arrive_margin_seconds", 60, 10, 600)
+        self.result_margin_seconds = self._load_int_config("result_margin_seconds", 40, 5, 600)
+        self.max_pending_fudai = self._load_int_config("max_pending_fudai", 5, 1, 20)
+        self.conflict_policy = self._load_choice_config(
+            "conflict_policy", "earlier_first", FudaiTaskQueue.POLICIES)
+        self.room_title_click_offset_y = self._load_int_config("room_title_click_offset_y", 0, -600, 600)
+        self.fudai_queue = FudaiTaskQueue(
+            arrive_margin=self.arrive_margin_seconds,
+            result_margin=self.result_margin_seconds,
+            max_pending=self.max_pending_fudai,
+            conflict_policy=self.conflict_policy)
+        if self.multi_room_enabled:
+            print("多房间排队已开启：回房预算{}秒，开奖后占用{}秒，冲突策略{}，队列上限{}".format(
+                self.arrive_margin_seconds, self.result_margin_seconds,
+                self.conflict_policy, self.max_pending_fudai))
 
     @staticmethod
     def in_hour_range(hour, start, end):
@@ -126,6 +166,25 @@ class fudai_analyse:
             print("{}={} 超过上限，按{}处理".format(key, number, maximum))
             return maximum
         return number
+
+    def _load_bool_config(self, key, default):
+        """从 config.json 读取一个布尔配置项，非布尔值回退默认值"""
+        value = self.operation.load_config("config.json", key, default=default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in ('true', 'false'):
+            return value.strip().lower() == 'true'
+        print("config.json 中的 {} 不是布尔值({!r})，按默认值{}处理".format(key, value, default))
+        return default
+
+    def _load_choice_config(self, key, default, choices):
+        """从 config.json 读取一个枚举配置项，不在候选集里就回退默认值"""
+        value = self.operation.load_config("config.json", key, default=default)
+        if value in choices:
+            return value
+        print("config.json 中的 {}={!r} 不在可选范围{}内，按默认值{}处理".format(
+            key, value, tuple(choices), default))
+        return default
 
     def _load_ocr_retry_times(self):
         """读取 config.json 的 ocr_retry_times（同一张裁剪图的 OCR 重复次数）"""
@@ -315,10 +374,67 @@ class fudai_analyse:
             print("界面未在直播间或未找到合适的偏移值,请联系叼哥处理")
             return 0
 
+    # ---- 福袋图标的搜索区域（1080x2400 基准坐标）----
+    # 旧实现只探 y=403 这一个像素行：实测某台 1280x2772 手机上，图标紫色区域从
+    # 本机 y=466 开始，而 403*1.155=465 —— 只差 1 个像素，整个福袋就漏掉了。
+    FUDAI_BAND_HALF = 35      # 以 403 为中心的纵向搜索带半径
+    FUDAI_X_START = 30        # 横向搜索范围
+    FUDAI_X_END = 440
+    FUDAI_COLOR = {'r': (183, 193), 'g': (172, 193), 'b': (237, 248)}
+    # 福袋详情里"参与按钮"所在的纵向带（1080x2400 基准，横向全宽）。
+    # 旧的固定裁剪区 (306,2030,780,2130) 太窄也太依赖机型：实测 1280x2772 上那块
+    # 正好是直播间的领券广告横幅，于是按钮永远匹配不上、福袋永远参与不了。
+    ATTEND_BAND = (0, 1860, 1080, 2340)
+    # 按钮是短标签，超过这个字数的行视为任务描述/广告，不当作按钮
+    ATTEND_LABEL_MAX_CHARS = 12
+    # 福袋详情面板的识别区域（相对面板顶部的偏移，1080x2400 基准）。
+    # 覆盖倒计时与奖品内容所在的整块上半部分，而不是两个"碰运气"的小裁剪框。
+    PANEL_BAND = (0, 0, 1080, 620)
+    # 倒计时的文字形态：数字 : 数字（OCR 常在冒号两侧留空格）
+    COUNTDOWN_PATTERN = re.compile(r'\d{1,2}\s*[:：]\s*\d{2}')
+    # 面板里带这些字样的行属于任务/按钮/提示，不是"奖品内容"
+    PANEL_NOISE_KEYWORDS = ('任务', '已达成', '未达成', '评论', '粉丝团', '抽奖',
+                            '参与', '开奖', '离开直播间', '说点什么', '购物', '领券')
+
+    def find_fudai_icon(self, arr):
+        """在福袋行附近的纵向带里找福袋图标
+
+        用整带匹配取代"单个像素行"探测：图标本身有几十像素高，
+        只探一行会因为它恰好不在那一行、或差一两像素而漏掉。
+
+        Returns:
+            (x, y) **本机像素坐标**下的命中点；没找到返回 None。
+            这里刻意不做基准坐标换算：换算会取整，来回一趟就可能差 1 个像素，
+            而"差 1 个像素"正是最初识别不到福袋的原因。
+        """
+        height, width = arr.shape[:2]
+        kx = self.resolution_ratio_x / 1080.0
+        ky = self.resolution_ratio_y / 2400.0
+        y0 = max(0, int((403 - self.FUDAI_BAND_HALF) * ky))
+        y1 = min(height, int((403 + self.FUDAI_BAND_HALF) * ky) + 1)
+        x0 = max(0, int(self.FUDAI_X_START * kx))
+        x1 = min(width, int(self.FUDAI_X_END * kx) + 1)
+        if y1 <= y0 or x1 <= x0:
+            return None
+        band = arr[y0:y1, x0:x1]
+        colors = self.FUDAI_COLOR
+        mask = ((band[:, :, 0] >= colors['r'][0]) & (band[:, :, 0] <= colors['r'][1]) &
+                (band[:, :, 1] >= colors['g'][0]) & (band[:, :, 1] <= colors['g'][1]) &
+                (band[:, :, 2] >= colors['b'][0]) & (band[:, :, 2] <= colors['b'][1]))
+        if not mask.any():
+            return None
+        # 取"离质心最近的真实命中像素"，而不是外接框中心：
+        # 图标的紫色只是轮廓/渐变（每行仅几个像素），外接框中心很可能落在空隙里是背景色，
+        # 点在那儿就会点偏。命中像素本身一定在图标上。
+        ys, xs = np.nonzero(mask)
+        center_row, center_col = ys.mean(), xs.mean()
+        nearest = int(np.argmin((ys - center_row) ** 2 + (xs - center_col) ** 2))
+        return x0 + int(xs[nearest]), y0 + int(ys[nearest])
+
     def check_have_fudai(self):
         """判定直播页面福袋的小图标是否存在
         Returns:
-            int or False: 如果找到福袋，返回x坐标；否则返回False
+            int or False: 如果找到福袋，返回命中点的基准 x 坐标；否则返回 False
         """
         path = os.path.dirname(__file__) + '/pic'
         pic_path = path + '/screenshot.png'
@@ -329,54 +445,30 @@ class fudai_analyse:
             print(f"第{loop+1}次判定直播间是否存在福袋，共计会判定{max_loops}次")
             self.operation.get_screenshot(self.device_id)
             try:
-                pic = Image.open(pic_path)
-                pic_new = pic.convert('RGBA')
-                pix = pic_new.load()
-                # 颜色范围
-                color_ranges = {
-                    'r': (183, 193),
-                    'g': (172, 193),
-                    'b': (237, 248)
-                }
-                # 检查每个x坐标
-                for base in [0, 126, 126 * 2, 126 * 3]:
-                    for x in range(33+base, 52+base):
-                        x_pos = x * self.resolution_ratio_x // 1080
-                        if self.y_pianyi != 0:
-                            # 检查三种偏移值的情况
-                            for y_offset in [0, self.y_pianyi, -self.y_pianyi]:
-                                y_pos = (403 + y_offset) * self.resolution_ratio_y // 2400
-                                pixel_color = pix[x_pos, y_pos]
-                                # 检查颜色是否在指定范围内
-                                if (color_ranges['r'][0] <= pixel_color[0] <= color_ranges['r'][1] and
-                                    color_ranges['g'][0] <= pixel_color[1] <= color_ranges['g'][1] and
-                                    color_ranges['b'][0] <= pixel_color[2] <= color_ranges['b'][1]):
-                                    self.last_find_fudai_time = time.time()
-                                    if y_offset != 0 and y_offset != self.y_pianyi:
-                                        self.y_pianyi = y_offset
-                                        print(f"重新调整偏移值到{y_offset}")
-                                    print(f"找到福袋X坐标：{x}")
-                                    if pic:
-                                        pic.close()
-                                    if self.device_id not in self.device_offsets:
-                                        self.device_offsets[self.device_id]=y_offset
-                                        self.operation.update_config_with_offsets("config.json",{self.device_id:y_offset})
-                                    return x
-                        else:
-                            y_pos = 403 * self.resolution_ratio_y // 2400
-                            pixel_color = pix[x_pos, y_pos]
-                            # 检查颜色是否在指定范围内
-                            if (color_ranges['r'][0] <= pixel_color[0] <= color_ranges['r'][1] and
-                                    color_ranges['g'][0] <= pixel_color[1] <= color_ranges['g'][1] and
-                                    color_ranges['b'][0] <= pixel_color[2] <= color_ranges['b'][1]):
-                                self.last_find_fudai_time = time.time()
-                                print(f"找到福袋X坐标：{x}")
-                                if pic:
-                                    pic.close()
-                                if self.device_id not in self.device_offsets:
-                                    self.device_offsets[self.device_id] = 0
-                                    self.operation.update_config_with_offsets("config.json", {self.device_id: 0})
-                                return x
+                with Image.open(pic_path) as pic:
+                    # 转 int16：三通道逐项比较不受影响，也不会在后续求和时溢出
+                    arr = np.asarray(pic.convert('RGB')).astype(np.int16)
+                hit = self.find_fudai_icon(arr)
+                if hit:
+                    hit_x_px, hit_y_px = hit          # 本机像素坐标
+                    x = int(hit_x_px * 1080 / self.resolution_ratio_x)   # 兼容旧返回值：基准 x
+                    y = int(hit_y_px * 2400 / self.resolution_ratio_y)
+                    self.last_find_fudai_time = time.time()
+                    # 点击用本机像素，不经过基准坐标来回换算，避免取整丢 1 个像素
+                    self.fudai_hit = (hit_x_px, hit_y_px)
+                    offset = y - 403
+                    if offset != self.y_pianyi:
+                        self.y_pianyi = offset
+                        print(f"根据福袋图标实际位置更新偏移值到{offset}")
+                    print("找到福袋：本机像素 x={} y={}（基准坐标 x={} y={}，颜色{}）".format(
+                        hit_x_px, hit_y_px, x, y,
+                        tuple(int(v) for v in arr[hit_y_px, hit_x_px])))
+                    if self.device_id not in self.device_offsets:
+                        self.device_offsets[self.device_id] = offset
+                        self.operation.update_config_with_offsets(
+                            "config.json", {self.device_id: offset})
+                        print(f"已把该设备的偏移值({offset})写入 config.json，下次启动无需再标定")
+                    return x
             except Exception as e:
                 print(e)
                 # 处理特殊情况
@@ -656,6 +748,70 @@ class fudai_analyse:
             return True
         return False
 
+    # ------------------------------------------------------------------
+    # 房间身份与导航（多房间排队抢福袋用）
+    # ------------------------------------------------------------------
+    # 直播间顶部房名区域（1080x2400 基准）。这个坐标需要真机标定：
+    # 用 tools/probe_device.py 打印实际 OCR 结果，确认能稳定认出房名再调整。
+    ROOM_TITLE_CROP = (140, 95, 760, 200)
+    # 关注列表整屏（OCR 坐标即设备像素坐标，便于直接点击）
+    FOLLOW_LIST_FULL_CROP = (0, 0, 1080, 2400)
+
+    @staticmethod
+    def room_key_from_title(title):
+        """把 OCR 出来的房间标题归一化成用于比对的 key
+
+        只保留中日韩文字与字母数字（去掉空格、标点、表情、括号里的人数等），
+        再截取前 8 个字符。这样"小明【已结束】"与"小明 直播中"会归一成同一个 key。
+        """
+        if not title:
+            return ''
+        kept = [ch for ch in title if ch.isalnum() or '\u4e00' <= ch <= '\u9fff']
+        return ''.join(kept)[:8]
+
+    def read_room_title(self):
+        """读当前直播间的房间名，返回归一化后的 key（空字符串表示没认出来）"""
+        self.cut_pic(*self.ROOM_TITLE_CROP, '', 'room_title')
+        title = self.operation.analyse_pic_word('room_title')
+        key = self.room_key_from_title(title)
+        print("当前房间标题：{}（key={}）".format(title, key))
+        return key
+
+    def find_room_in_follow_list(self, room_key, max_scrolls=4, click_offset_y=None):
+        """在「关注 → 直播中」列表里按房间名找到并点进去
+
+        这是"快到开奖时回到对应直播间"的落地点：逐屏整屏 OCR，取出每段文字的
+        中心坐标，与 room_key 比对，命中就点它。
+
+        注意：房名区域与列表卡片名称的对应关系需要真机标定，
+        先用 tools/probe_device.py --dump-list 看实际 OCR 结果。
+
+        Returns:
+            bool: 是否成功进入目标直播间
+        """
+        if not room_key:
+            return False
+        if click_offset_y is None:
+            click_offset_y = self.room_title_click_offset_y
+        for scroll in range(max_scrolls + 1):
+            self.operation.get_screenshot(self.device_id)
+            self.cut_pic(*self.FOLLOW_LIST_FULL_CROP, '', 'follow_list_full')
+            boxes = self.operation.analyse_pic_word_with_boxes('follow_list_full')
+            for item in boxes:
+                if room_key in self.room_key_from_title(item['text']):
+                    click_y = item['y'] + click_offset_y
+                    print("关注列表命中房间：{}（点击 {},{}）".format(item['text'], item['x'], click_y))
+                    # 整屏裁剪下 OCR 坐标就是设备像素，直接点，避免二次换算
+                    self.operation.click(self.device_id, item['x'], click_y)
+                    self.operation.delay(4)
+                    return True
+            if scroll < max_scrolls:
+                print("本屏未找到目标房间，上划继续找（第{}屏）".format(scroll + 1))
+                self.swipe(760, 1800, 760, 900, 200)
+                self.operation.delay(3)
+        print("关注列表里没找到房间：{}".format(room_key))
+        return False
+
     def back_to_zhibo_list(self):
         """功能初始化，回到直播间列表"""
         click_back_times = 0
@@ -770,22 +926,82 @@ class fudai_analyse:
             return wait_time
         return 0
 
+    def read_fudai_panel(self, top_y, change_color=0):
+        """OCR 福袋详情面板（相对面板顶部的一整条带），返回所有文字行及其屏幕像素坐标
+
+        旧实现用两个固定偏移去裁"内容区"和"倒计时区"，在非基准分辨率的机型上会裁到
+        旁边的商品卡片上：实测倒计时有时读成"13 : 47大容量立体多功育"（还能用），
+        有时整块读成商品描述"丝塔美自修次红部缘护一变盛库" → "时间格式异常" → 福袋被放弃。
+
+        Returns:
+            list[dict]: [{'text','x','y','w','h','score'}, ...]，y 已换算成**本机像素**
+        """
+        if not isinstance(top_y, int) or isinstance(top_y, bool) or top_y <= 0:
+            return []
+        x0, y0, x1, y1 = self.PANEL_BAND
+        self.cut_pic(x0, top_y + y0, x1, top_y + y1, '', 'fudai_panel')
+        boxes = self.operation.analyse_pic_word_with_boxes('fudai_panel', change_color)
+        origin_y = (top_y + y0) * self.resolution_ratio_y // 2400
+        for item in boxes:
+            item['y'] += origin_y
+        return boxes
+
+    def find_countdown_text(self, panel_boxes):
+        """在面板文字里按"数字:数字"的形态找倒计时，不依赖位置
+
+        OCR 常把冒号两侧识别出空格（"13 : 47"），也常把倒计时和旁边的商品描述粘在一行
+        （"10 : 36大容量立体多功育"），所以用正则在整个面板文字里搜。
+
+        多个候选时取**文本最短**的那行：纯倒计时很短，而"商品描述里恰好带个时间"
+        往往是长句；同样短则取更靠上的（倒计时在面板上半部）。
+        """
+        matches = [item for item in panel_boxes if self.COUNTDOWN_PATTERN.search(item['text'])]
+        if not matches:
+            return ''
+        return min(matches, key=lambda item: (len(item['text']), item['y']))['text']
+
     def get_fudai_contain_and_countdown(self, top_y=1000):
-        """截取福袋的内容和倒计时，并识别内容"""
+        """识别福袋的奖品内容与开奖倒计时"""
         if not isinstance(top_y, int) or isinstance(top_y, bool) or top_y <= 0:
             print(f"福袋详情顶部坐标异常({top_y})，跳过本轮内容识别")
             return '', ''
-        self.cut_pic(390, top_y + 265,
-                     1010, top_y + 475,
-                     '', 'fudai_content')
-        self.cut_pic(690, top_y + 0,
-                     970, top_y + 240,
-                     '', 'fudai_countdown')
-        fudai_content_text = self.operation.analyse_pic_word('fudai_content', 1)
-        time_text = self.operation.analyse_pic_word('fudai_countdown', 2)
+        # 两种二值化模式都跑一遍：倒计时是浅色数字，个别模式下更清晰
+        panel = self.read_fudai_panel(top_y, 0) + self.read_fudai_panel(top_y, 2)
+        time_text = self.find_countdown_text(panel)
+        content_lines = []
+        for item in sorted(panel, key=lambda box: box['y']):
+            text = item['text']
+            # 两种模式会把同一行识别两遍，去重后再拼接（否则日志里会出现"鱼竿套装鱼竿套装"）
+            if text == time_text or text in content_lines:
+                continue
+            if any(word in text for word in self.PANEL_NOISE_KEYWORDS):
+                continue
+            content_lines.append(text)
+        fudai_content_text = ''.join(content_lines)
         print(f"福袋内容：{fudai_content_text}")
         print(f"倒计时时间：{time_text}")
         return fudai_content_text, time_text
+
+    def read_attend_button(self, change_color=1):
+        """OCR 福袋详情下部的"参与按钮"带
+
+        旧实现固定裁 (306,2030,780,2130)：实测某 1280x2772 机型上那块地方是直播间的
+        领券广告横幅（OCR 出来是"领券，1+2号合并付！到手318"），压根没拍到按钮，
+        于是永远"按钮文字没匹配上"、永远参与不了。
+
+        Returns:
+            (text, boxes)：拼接后的文本；boxes 里每段的 x/y 已换算成**本机像素**坐标，
+            可直接用于点击（不再经过基准坐标来回换算，避免取整丢像素）
+        """
+        x0, y0 = self.ATTEND_BAND[0], self.ATTEND_BAND[1]
+        self.cut_pic(*self.ATTEND_BAND, '', 'attend_button')
+        boxes = self.operation.analyse_pic_word_with_boxes('attend_button', change_color)
+        origin_x = x0 * self.resolution_ratio_x // 1080
+        origin_y = y0 * self.resolution_ratio_y // 2400
+        for item in boxes:
+            item['x'] += origin_x
+            item['y'] += origin_y
+        return ''.join(item['text'] for item in boxes), boxes
 
     def check_contain(self, contains='', current_hour=None):
         """检查福袋内容是否是想要，从配置文件config中读取"""
@@ -815,6 +1031,49 @@ class fudai_analyse:
             self.click(500, 470)
             print("点击福袋外部，关闭福袋详情")
             self.operation.delay(1)
+
+        def click_attend_button(keywords, label):
+            """在按钮带识别出的文字里找到真正的按钮行，点它的中心
+
+            旧实现不管按钮在哪都点固定位置 (500,2060)：按钮一旦不在那儿就点空，
+            表现就是"按钮文字没匹配上/参与不了"。
+
+            选行的启发式（来自真机实测数据）：按钮是**短标签**并且位于面板**底部**，
+            而任务描述/广告是长句子且在上面。实测同一屏里：
+                '发送评论：右上角领券，1+2号合并付！到手318元'  y=2374 宽867  ← 任务描述
+                '一键发表评论'                                y=2525 宽292  ← 真按钮
+            所以先按长度过滤掉长句子，再在剩下的里面取最靠下的那行。
+            """
+            candidates = [item for item in attend_boxes
+                          if any(word in item['text'] for word in keywords)]
+            if candidates:
+                short_labels = [item for item in candidates if len(item['text']) <= self.ATTEND_LABEL_MAX_CHARS]
+                pool = short_labels or candidates
+                target = max(pool, key=lambda item: item['y'])
+                print("{}：点击 ({}, {}) 处的「{}」（候选{}个）".format(
+                    label, target['x'], target['y'], target['text'], len(candidates)))
+                self.operation.click(self.device_id, target['x'], target['y'])
+            else:
+                print("{}：按钮带里没定位到按钮行，退回固定位置点击".format(label))
+                self.click(500, 2060)
+
+        def handle_comment_task():
+            """点完"发表评论"类按钮后，如果弹出的是评论输入界面，就真的发一条评论
+
+            有的福袋要求"发表评论"才算完成任务，只点一下按钮不算。
+            这里以"画面里出现了发送按钮"为判据，检测不到就不做任何动作（不乱点）。
+            """
+            self.operation.get_screenshot(self.device_id)
+            if not self.check_can_send_comment():
+                return False
+            comment = random.choice(self.video_comments) if self.video_comments else '不错'
+            print("检测到评论输入界面，输入并发送评论：{}".format(comment))
+            self.operation.input_text(self.device_id, comment)
+            self.operation.delay(1)
+            self.click(940, 2180)
+            print("点击发送评论")
+            self.operation.delay(2)
+            return True
             
         def handle_special_buttons():
             """处理特殊按钮情况"""
@@ -837,17 +1096,14 @@ class fudai_analyse:
         def handle_participation_buttons():
             """处理参与按钮情况"""
             if "评论" in attend_button_text or "参与抽奖" in attend_button_text:
-                self.click(500, 2060)
-                print("点击参与抽奖")
+                click_attend_button(("评论", "参与抽奖"), "点击参与抽奖")
                 self.operation.delay(2)
                 return True
             elif "开始观看" in attend_button_text:
-                self.click(500, 2060)
-                print("点击开始观看直播，参与抽奖")
+                click_attend_button(("开始观看",), "点击开始观看直播，参与抽奖")
                 return True
             elif "粉丝团" in attend_button_text:
-                self.click(500, 2060)
-                print("点击加入粉丝团、点亮粉丝团")
+                click_attend_button(("粉丝团",), "点击加入粉丝团、点亮粉丝团")
                 self.operation.delay(2)
                 close_fudai_detail()
                 return False
@@ -878,9 +1134,9 @@ class fudai_analyse:
             return None
 
         click_times = 0
+        attend_boxes = []
         while click_times < 2:
-            self.cut_pic(306, 2030, 780, 2130, '', 'attend_button')
-            attend_button_text = self.operation.analyse_pic_word('attend_button', 1)
+            attend_button_text, attend_boxes = self.read_attend_button()
             print(f"参与抽奖按钮文字内容：{attend_button_text}")
             
             # 处理特殊按钮情况
@@ -891,10 +1147,12 @@ class fudai_analyse:
             # 处理参与按钮情况
             result = handle_participation_buttons()
             if result is not None:
+                # 评论类任务：点完按钮后可能还要真的发一条评论才算完成
+                if "评论" in attend_button_text:
+                    handle_comment_task()
                 # 第一次点击参与后，立即二次判定是否出现“开始观看”等需要第二次点击的状态
                 self.operation.get_screenshot(self.device_id)
-                self.cut_pic(306, 2030, 780, 2130, '', 'attend_button')
-                attend_button_text = self.operation.analyse_pic_word('attend_button', 1)
+                attend_button_text, attend_boxes = self.read_attend_button()
                 print(f"二次判定参与抽奖按钮文字内容：{attend_button_text}")
                 result_second = handle_participation_buttons()
                 if result_second is not None:
@@ -997,6 +1255,7 @@ class fudai_analyse:
             if battery_level >= self.BATTERY_LOW_THRESHOLD:
                 return
             print("设备电量较低，退出到直播列表，等待电量恢复后继续挂机")
+            self.status.set_phase('电量不足，等待充电')
             self.back_to_zhibo_list()
             self.operation.delay(1800)  # 挂机30分钟
 
@@ -1051,6 +1310,7 @@ class fudai_analyse:
         def initialize():
             """初始化参数"""
             self.device_id = device_id
+            self.status.set_device(device_id)
             self.resolution_ratio_x, self.resolution_ratio_y = self.operation.get_device_resolution(self.device_id)
             self.apply_screen_brightness()  # 先调低亮度省电，再做后续识别
             self.y_pianyi = self.find_y_offset()
@@ -1067,6 +1327,7 @@ class fudai_analyse:
                 self.operation.stop_douyin_app(self.device_id)
                 wait_time = self.WAKE_HOUR - current_hour
                 print(f"已经凌晨{current_hour}点了，关闭抖音，等待{wait_time}个小时")
+                self.status.set_phase('夜间停机，{}小时后唤醒'.format(wait_time))
                 self.operation.delay(3600*wait_time)
                 self.restart_and_reset()
                 return True
@@ -1085,7 +1346,11 @@ class fudai_analyse:
             """处理福袋点击"""
             if x:
                 stats['wait_times'] = 0
-                self.click(x + 25, 430 + self.y_pianyi)
+                if self.fudai_hit:
+                    # 直接点在刚命中的图标像素上（本机像素坐标，不做缩放）
+                    self.operation.click(self.device_id, self.fudai_hit[0], self.fudai_hit[1])
+                else:
+                    self.click(x + 25, 430 + self.y_pianyi)
                 print("点击打开福袋详情")
                 self.operation.delay(3)
                 return True
@@ -1306,6 +1571,12 @@ class fudai_analyse:
         while True:
             self.deal_battery_level()
             current_hour = self.operation.get_current_hour()
+            self.status.set_phase('在直播间找福袋')
+            if self.multi_room_enabled:
+                # 把排队中的任务也投给悬浮窗显示（多房间功能接线后即生效）
+                self.status.set_pending([
+                    {'room': task.room_key, 'prize': task.prize, 'draw_ts': task.draw_ts}
+                    for task in self.fudai_queue.tasks if task.state == 'pending'])
             # 检查各种情况
             if handle_night_time(current_hour):
                 continue
@@ -1346,15 +1617,22 @@ class fudai_analyse:
             # 检查倒计时时间
             if handle_countdown_check(x, stats, lastsecond, needswitch, effective_max_minutes):
                 continue
-                
+
+            # 到这里才是"真的在等这个福袋开奖"，登记给悬浮窗显示倒计时
+            self.status.set_draw(future_timestamp, fudai_content_text)
+
             # 参与抽奖
             if not self.attend_choujiang():
+                self.status.clear_draw()
                 handle_failed_participation(stats)
                 continue
-                
+
+            self.status.set_phase('已参与，等待开奖')
             # 等待开奖
             print(f"等待{lastsecond+5}秒后开奖")
             self.operation.delay(lastsecond + 5)
+            self.status.clear_draw()      # 已到开奖时刻，倒计时不再有效
+            self.status.set_phase('处理开奖结果')
             
             # 处理开奖结果和后续操作
             if handle_after_draw(x, stats, needswitch):
