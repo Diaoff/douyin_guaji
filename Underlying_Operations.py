@@ -19,6 +19,8 @@ class underlying_operations:
     ADB_LONG_TIMEOUT = 90    # 截图/传输/启动类命令的超时（秒）
     ADB_RETRIES = 3          # 只读命令的尝试次数：瞬时失败（超时/返回码非0）可重试
     MUTATING_RETRIES = 1     # 有副作用命令（点击/滑动/输入/启停应用）只尝试1次，避免重复操作
+    # 运行时缓存文件名（设备偏移值等运行产物写这里，不污染被版本管理的 config.json）
+    RUNTIME_CACHE_PATH = 'device_cache.json'
 
     def __init__(self):
         self.ocr = PaddleOCR()
@@ -631,32 +633,57 @@ class underlying_operations:
         return config.get(key, default)
 
 
-    def update_config_with_offsets(self, config_path="config.json", device_offsets=None):
+    def load_device_offsets(self):
+        """读取设备偏移值
+
+        优先读运行时缓存 device_cache.json；同时兼容历史上写在 config.json 里的记录。
+        之所以要分开：设备偏移值是**运行产物**，写进被版本管理的 config.json 会让它
+        每跑一次就变脏，一不小心就把你的设备序列号提交/推到公开仓库。
         """
-        更新设备偏移值到配置文件
-        仅新增未写入过的设备偏移值，不覆盖已存在的记录。
+        offsets = {}
+        legacy = self._read_json_file("config.json", {})
+        if isinstance(legacy, dict) and isinstance(legacy.get('device_offsets'), dict):
+            offsets.update(legacy['device_offsets'])
+        cache = self._read_json_file(self.RUNTIME_CACHE_PATH, {})
+        if isinstance(cache, dict) and isinstance(cache.get('device_offsets'), dict):
+            offsets.update(cache['device_offsets'])
+        return offsets
+
+    def _read_json_file(self, name, default):
+        """读一个与脚本同目录的 json 文件，缺失或损坏时返回 default"""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+        if not os.path.exists(path):
+            path = self._resolve_config_path(name)
+        if not os.path.exists(path):
+            return default
+        try:
+            with open(path, 'r', encoding='utf-8') as file:
+                return json.load(file)
+        except (OSError, ValueError) as e:
+            print("读取{}失败({})，忽略".format(name, e))
+            return default
+
+    def update_config_with_offsets(self, config_path=None, device_offsets=None):
+        """把新识别到的设备偏移值写进**运行时缓存** device_cache.json
+
+        仅新增未写入过的条目，不覆盖已有记录。
+        注意：不再改动被版本管理的 config.json（那样每跑一次就脏一次，
+        还容易把设备序列号提交进公开仓库）。
         """
+        # 兼容旧调用：update_config_with_offsets("config.json", {...})
+        if isinstance(config_path, dict):
+            device_offsets = config_path
         if device_offsets is None:
             device_offsets = {}
-        config_path = self._resolve_config_path(config_path)
 
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as file:
-                try:
-                    config = json.load(file)
-                except Exception:
-                    config = {}
-        else:
-            config = {}
-
-        existing_map = config.get('device_offsets', {})
-        # 仅合并未存在的条目
-        new_entries = {device_id: offset for device_id, offset in device_offsets.items() if device_id not in existing_map}
+        existing_map = self.load_device_offsets()
+        new_entries = {device_id: offset for device_id, offset in device_offsets.items()
+                       if device_id not in existing_map}
         if not new_entries:
             return False
 
         existing_map.update(new_entries)
-        config['device_offsets'] = existing_map
-        with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=4, ensure_ascii=False)
+        target = os.path.join(os.path.dirname(os.path.abspath(__file__)), self.RUNTIME_CACHE_PATH)
+        with open(target, 'w', encoding='utf-8') as f:
+            json.dump({'device_offsets': existing_map}, f, indent=4, ensure_ascii=False)
         return True

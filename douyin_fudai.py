@@ -98,7 +98,7 @@ class fudai_analyse:
         self.contains_not_want = self.operation.load_config("config.json", "contains_not_want")
         self.contains_want = self.operation.load_config("config.json", "contains_want")
         self.video_comments = self.operation.load_config("config.json", "video_comment")
-        self.device_offsets = self.operation.load_config("config.json", "device_offsets")
+        self.device_offsets = self.operation.load_device_offsets()
         # 需要处理"停止充电"弹窗的设备（如 vivo），原先硬编码在代码里
         self.charging_notice_devices = self.operation.load_config("config.json", "charging_notice_devices")
         self.ocr_retry_times = self._load_ocr_retry_times()
@@ -465,9 +465,8 @@ class fudai_analyse:
                         tuple(int(v) for v in arr[hit_y_px, hit_x_px])))
                     if self.device_id not in self.device_offsets:
                         self.device_offsets[self.device_id] = offset
-                        self.operation.update_config_with_offsets(
-                            "config.json", {self.device_id: offset})
-                        print(f"已把该设备的偏移值({offset})写入 config.json，下次启动无需再标定")
+                        self.operation.update_config_with_offsets(device_offsets={self.device_id: offset})
+                        print(f"已把该设备的偏移值({offset})写入 device_cache.json，下次启动无需再标定")
                     return x
             except Exception as e:
                 print(e)

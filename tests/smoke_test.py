@@ -1308,6 +1308,53 @@ rec = run_attend('参与抽奖', [{'text': '参与', 'x': 100, 'y': 2500, 'w': 6
 check("关键词被拆框、找不到整行按钮时：退回固定位置盲点一次",
       rec['result'] is True and any(c == (500, 2060) for c in rec['clicks']), str(rec['clicks']))
 
+# ---------- 21. 设备偏移值改存运行时缓存（不再污染 config.json）----------
+import json as _json  # noqa: E402
+import shutil as _shutil  # noqa: E402
+
+cache_path = os.path.join(REPO_ROOT, ops.RUNTIME_CACHE_PATH)
+config_path = os.path.join(REPO_ROOT, 'config.json')
+cache_backup = None
+if os.path.exists(cache_path):
+    cache_backup = open(cache_path, 'rb').read()
+
+config_before = open(config_path, 'rb').read()
+offset_before = ops.load_device_offsets()
+check("偏移值：能读到 config.json 里的历史记录（兼容旧配置）",
+      offset_before.get('XXXXXXX') == -50, str(offset_before))
+
+try:
+    wrote = ops.update_config_with_offsets(device_offsets={'smoke-test-device': 12})
+    check("偏移值：新设备写入运行时缓存", wrote is True)
+    check("偏移值：缓存文件已生成且内容正确",
+          os.path.exists(cache_path)
+          and _json.load(open(cache_path, encoding='utf-8'))['device_offsets'].get('smoke-test-device') == 12,
+          open(cache_path, encoding='utf-8').read()[:120] if os.path.exists(cache_path) else '缺失')
+    check("偏移值：写完不再改动被版本管理的 config.json",
+          open(config_path, 'rb').read() == config_before)
+    check("偏移值：老记录与新记录能同时读出",
+          ops.load_device_offsets().get('XXXXXXX') == -50
+          and ops.load_device_offsets().get('smoke-test-device') == 12,
+          str(ops.load_device_offsets()))
+    check("偏移值：重复写入同一设备返回 False（不覆盖已有记录）",
+          ops.update_config_with_offsets(device_offsets={'smoke-test-device': 99}) is False)
+    check("偏移值：旧式调用签名也能兼容",
+          ops.update_config_with_offsets('config.json', {'smoke-test-device2': 7}) is True
+          and ops.load_device_offsets().get('smoke-test-device2') == 7)
+    check("偏移值：device_cache.json 已被 .gitignore 忽略",
+          sp.run(['git', 'check-ignore', ops.RUNTIME_CACHE_PATH],
+                 cwd=REPO_ROOT, capture_output=True).returncode == 0)
+finally:
+    if cache_backup is None:
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+    else:
+        open(cache_path, 'wb').write(cache_backup)
+    open(config_path, 'wb').write(config_before)
+check("偏移值：测试后已恢复原状",
+      open(config_path, 'rb').read() == config_before
+      and ops.load_device_offsets().get('smoke-test-device') is None)
+
 # ---------- 汇总 ----------
 failed = [r for r in results if not r[1]]
 print("\n===== 冒烟结果: %d/%d 通过 =====" % (len(results) - len(failed), len(results)))

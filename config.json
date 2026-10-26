@@ -36,9 +36,9 @@
         "Love the energy in this video!",
         "This is so creative and well-made!"
     ],
+    "_note_device_offsets": "设备偏移值的旧位置（已改为写入运行时缓存 device_cache.json，不再改动本文件）。这里的记录仍会被读取，用于兼容老配置",
     "device_offsets": {
-        "XXXXXXX": -50,
-        "7ade6544": 0
+        "XXXXXXX": -50
     },
     "_note_charging_notice_devices": "需要处理系统'停止充电'弹窗的设备序列号(如vivo机型)，即 adb devices 里看到的编号；不需要该判定就留空数组 []",
     "charging_notice_devices": [
